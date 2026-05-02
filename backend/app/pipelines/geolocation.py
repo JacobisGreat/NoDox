@@ -1,0 +1,641 @@
+"""Geolocation pipeline.
+
+Looks at every public post image and tries to figure out where it was
+taken. Four signal channels feed an aggregator:
+
+1. EXIF GPS — the highest-confidence channel, when present at all.
+2. Instagram location tag — the user explicitly tagged the spot.
+3. VLM analysis — Haiku scans the image for street signs, transit
+   logos, license plates, vegetation, architectural style, etc.
+4. GeoCLIP — a CLIP-based embedding model that predicts GPS coords
+   directly from pixels.
+
+Per-image findings are emitted the moment they're discovered so the
+dashboard streams in real time. Once enough signals accumulate, Sonnet
+reconciles them into region-level clusters.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import io
+import json
+import os
+import tempfile
+from typing import Any
+
+from app.config import get_settings
+from app.schemas.events import (
+    cost_update as _cost_update_event,
+    finding as _finding_event,
+    pipeline_status as _pipeline_status_event,
+)
+from app.schemas.findings import Finding
+from app.session_store import SessionState
+
+try:
+    from PIL import Image
+    from PIL.ExifTags import GPSTAGS
+except ImportError:  # pragma: no cover — declared in requirements.txt
+    Image = None  # type: ignore[assignment]
+    GPSTAGS = {}  # type: ignore[assignment]
+
+
+_PIPELINE = "geolocation"
+_MAX_POSTS = 20
+_MIN_SIGNALS_FOR_AGGREGATION = 3
+_GEOCLIP_MIN_CONFIDENCE = 0.10
+_CLUSTER_EMIT_THRESHOLD = 0.40
+
+# Rough cost estimates used for budget-gating before each call.
+_HAIKU_VISION_COST_GUESS = 0.01
+_SONNET_AGGREGATION_COST_GUESS = 0.03
+
+
+_VLM_SYSTEM_PROMPT = (
+    "You are a geolocation analyst. Examine this image for location signals: "
+    "street signs, business names, transit logos, license plate formats, "
+    "landmarks, architectural style, vegetation type, language on signs, "
+    "shadow direction. Respond with JSON: {\"signals\": [{\"type\": str, "
+    "\"description\": str, \"location_hint\": str, \"confidence\": float}], "
+    "\"best_guess_region\": str | null}"
+)
+
+_AGGREGATOR_SYSTEM_PROMPT = (
+    "You are a geolocation intelligence aggregator. Given these location "
+    "signals from multiple social media posts, identify the most likely "
+    "regions/cities the user frequents. Cross-reference signals. Respond "
+    "with JSON: {\"clusters\": [{\"region\": str, \"confidence\": float, "
+    "\"evidence\": [str], \"risk_level\": \"LOW\"|\"MEDIUM\"|\"HIGH\"|\"CRITICAL\"}]}"
+)
+
+
+# ---------------------------------------------------------------------------
+# Lazy GeoCLIP loader. Heavy import (torch + model weights) — we only pay
+# the cost once per process and only when geolocation actually runs.
+# ---------------------------------------------------------------------------
+
+_geoclip_model: Any = None
+_geoclip_load_attempted = False
+_geoclip_load_error: str | None = None
+
+
+def _load_geoclip_sync() -> Any:
+    global _geoclip_model, _geoclip_load_attempted, _geoclip_load_error
+    if _geoclip_model is not None or _geoclip_load_attempted:
+        return _geoclip_model
+    _geoclip_load_attempted = True
+    try:
+        from geoclip import GeoCLIP  # type: ignore[import-not-found]
+
+        _geoclip_model = GeoCLIP()
+    except Exception as exc:  # noqa: BLE001 — any failure disables this channel
+        _geoclip_load_error = str(exc)
+        _geoclip_model = None
+    return _geoclip_model
+
+
+# ---------------------------------------------------------------------------
+# EXIF GPS helpers.
+# ---------------------------------------------------------------------------
+
+
+def _to_float(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        try:
+            num, den = value.numerator, value.denominator  # type: ignore[attr-defined]
+            if den == 0:
+                return None
+            return num / den
+        except Exception:
+            return None
+
+
+def _dms_to_decimal(dms: Any) -> float | None:
+    if dms is None:
+        return None
+    try:
+        d, m, s = dms[0], dms[1], dms[2]
+    except Exception:
+        return None
+    df = _to_float(d)
+    mf = _to_float(m)
+    sf = _to_float(s)
+    if df is None or mf is None or sf is None:
+        return None
+    return df + mf / 60.0 + sf / 3600.0
+
+
+def _extract_gps_sync(image_bytes: bytes) -> tuple[float, float] | None:
+    if Image is None:
+        return None
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+        exif = img._getexif()  # type: ignore[attr-defined]
+    except Exception:
+        return None
+    if not exif:
+        return None
+    gps_info = exif.get(34853)  # GPSInfo IFD tag id
+    if not gps_info:
+        return None
+    try:
+        gps_data = {GPSTAGS.get(k, k): v for k, v in gps_info.items()}
+    except Exception:
+        return None
+    lat = _dms_to_decimal(gps_data.get("GPSLatitude"))
+    lon = _dms_to_decimal(gps_data.get("GPSLongitude"))
+    if lat is None or lon is None:
+        return None
+    if str(gps_data.get("GPSLatitudeRef", "N")).upper().startswith("S"):
+        lat = -lat
+    if str(gps_data.get("GPSLongitudeRef", "E")).upper().startswith("W"):
+        lon = -lon
+    if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+        return None
+    return lat, lon
+
+
+# ---------------------------------------------------------------------------
+# GeoCLIP helpers.
+# ---------------------------------------------------------------------------
+
+
+def _geoclip_predict_sync(image_bytes: bytes, top_k: int = 5) -> list[dict]:
+    model = _load_geoclip_sync()
+    if model is None:
+        return []
+    tmp_path: str | None = None
+    try:
+        # GeoCLIP expects an image path on disk. Write to a temp file we
+        # delete in the finally block so we never leak inodes.
+        fd, tmp_path = tempfile.mkstemp(suffix=".jpg", prefix="nodoxx_geo_")
+        os.close(fd)
+        with open(tmp_path, "wb") as f:
+            f.write(image_bytes)
+        result = model.predict(tmp_path, top_k=top_k)
+    except Exception:
+        return []
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+    predictions: list[dict] = []
+    try:
+        # geoclip returns (gps_tensor, prob_tensor) in newer versions.
+        if isinstance(result, tuple) and len(result) == 2:
+            coords, probs = result
+            for i in range(min(top_k, len(coords))):
+                lat = float(coords[i][0])
+                lon = float(coords[i][1])
+                conf = float(probs[i])
+                predictions.append({"lat": lat, "lon": lon, "confidence": conf})
+        elif isinstance(result, list):
+            for entry in result[:top_k]:
+                if isinstance(entry, (list, tuple)) and len(entry) >= 3:
+                    predictions.append(
+                        {
+                            "lat": float(entry[0]),
+                            "lon": float(entry[1]),
+                            "confidence": float(entry[2]),
+                        }
+                    )
+    except Exception:
+        return []
+    return predictions
+
+
+# ---------------------------------------------------------------------------
+# JSON parsing helper for model responses.
+# ---------------------------------------------------------------------------
+
+
+def _parse_json_response(raw: str) -> dict | None:
+    if not raw:
+        return None
+    cleaned = raw.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.strip("`")
+        if "\n" in cleaned:
+            cleaned = cleaned.split("\n", 1)[1]
+        if cleaned.endswith("```"):
+            cleaned = cleaned[:-3]
+    try:
+        parsed = json.loads(cleaned)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    return parsed
+
+
+# ---------------------------------------------------------------------------
+# Finding emission helpers.
+# ---------------------------------------------------------------------------
+
+
+async def _emit_finding(session: SessionState, finding: Finding) -> None:
+    payload = finding.to_dict()
+    findings_log: list[dict] = session.data.setdefault("findings", [])
+    tagged = dict(payload)
+    tagged["_pipeline"] = _PIPELINE
+    findings_log.append(tagged)
+    await session.publish_event(_finding_event(_PIPELINE, payload))
+
+
+async def _emit_cost(session: SessionState) -> None:
+    tracker = session.data.get("cost_tracker")
+    if tracker is None:
+        return
+    await session.publish_event(_cost_update_event(tracker.total_usd))
+
+
+def _shortcode_url(shortcode: str) -> str:
+    return f"https://instagram.com/p/{shortcode}"
+
+
+# ---------------------------------------------------------------------------
+# Per-post processing.
+# ---------------------------------------------------------------------------
+
+
+async def _process_location_tag(session: SessionState, post: dict) -> dict | None:
+    location_name = post.get("location_name")
+    if not location_name:
+        return None
+    shortcode = post.get("shortcode") or "unknown"
+    finding = Finding(
+        source="instagram_location_tag",
+        evidence_chain=[
+            f"Post: {_shortcode_url(shortcode)}",
+            f"Instagram location tag: {location_name}",
+        ],
+        confidence=0.85,
+        risk_level="HIGH",
+        remediation=(
+            "Open Instagram, edit the post at "
+            f"{_shortcode_url(shortcode)}, and remove the tagged location. "
+            "Going forward, disable location tagging in Settings > Privacy."
+        ),
+        metadata={
+            "location_name": location_name,
+            "location_id": post.get("location_id"),
+            "shortcode": shortcode,
+        },
+    )
+    await _emit_finding(session, finding)
+    return {
+        "type": "instagram_location_tag",
+        "description": location_name,
+        "location_hint": location_name,
+        "confidence": 0.85,
+        "shortcode": shortcode,
+    }
+
+
+async def _process_vlm(
+    session: SessionState,
+    post: dict,
+    image_bytes: bytes,
+    media_type: str,
+) -> list[dict]:
+    settings = get_settings()
+    cost_tracker = session.data.get("cost_tracker")
+    anthropic = session.data.get("anthropic")
+    sem: asyncio.Semaphore | None = session.data.get("vision_semaphore")
+
+    if anthropic is None or not settings.anthropic_api_key:
+        return []
+    if cost_tracker is not None and not cost_tracker.can_spend(
+        _HAIKU_VISION_COST_GUESS
+    ):
+        return []
+
+    shortcode = post.get("shortcode") or "unknown"
+
+    async def _call() -> tuple[str, dict] | None:
+        try:
+            return await anthropic.call_vision(
+                model=settings.anthropic_haiku_model,
+                system=_VLM_SYSTEM_PROMPT,
+                image_bytes=image_bytes,
+                image_media_type=media_type,
+                prompt=(
+                    f"Analyze this Instagram post image (shortcode {shortcode}) "
+                    "for any location signals. Return JSON only."
+                ),
+                max_tokens=1024,
+            )
+        except Exception:
+            return None
+
+    if sem is not None:
+        async with sem:
+            result = await _call()
+    else:
+        result = await _call()
+
+    if result is None:
+        return []
+    text, usage = result
+    if cost_tracker is not None:
+        cost_tracker.record_anthropic(usage, scope="geolocation")
+        await _emit_cost(session)
+
+    parsed = _parse_json_response(text)
+    if parsed is None:
+        return []
+
+    raw_signals = parsed.get("signals") or []
+    best_guess = parsed.get("best_guess_region")
+    signals: list[dict] = []
+    if isinstance(raw_signals, list):
+        for sig in raw_signals:
+            if not isinstance(sig, dict):
+                continue
+            try:
+                conf = float(sig.get("confidence", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                conf = 0.0
+            signals.append(
+                {
+                    "type": str(sig.get("type", "") or "vlm_signal"),
+                    "description": str(sig.get("description", "") or ""),
+                    "location_hint": str(sig.get("location_hint", "") or ""),
+                    "confidence": max(0.0, min(1.0, conf)),
+                    "best_guess_region": str(best_guess) if best_guess else None,
+                    "shortcode": shortcode,
+                }
+            )
+
+    # Per-post emission for distinctive landmark hits — corroboration is
+    # the aggregator's job, but a confident landmark is worth surfacing now.
+    for sig in signals:
+        if sig["confidence"] >= 0.75 and sig["location_hint"]:
+            finding = Finding(
+                source="vlm_landmark",
+                evidence_chain=[
+                    f"Post: {_shortcode_url(shortcode)}",
+                    f"Visual signal: {sig['type']}",
+                    f"Description: {sig['description']}",
+                    f"Hint: {sig['location_hint']}",
+                ],
+                confidence=min(0.8, sig["confidence"]),
+                risk_level="MEDIUM",
+                remediation=(
+                    f"Review the post at {_shortcode_url(shortcode)} — the "
+                    f"image visibly reveals {sig['location_hint']}. Crop or "
+                    "remove identifying scenery, or delete the post."
+                ),
+                metadata={
+                    "shortcode": shortcode,
+                    "signal_type": sig["type"],
+                    "location_hint": sig["location_hint"],
+                },
+            )
+            await _emit_finding(session, finding)
+
+    return signals
+
+
+async def _process_geoclip(
+    session: SessionState, post: dict, image_bytes: bytes
+) -> list[dict]:
+    predictions = await asyncio.to_thread(_geoclip_predict_sync, image_bytes, 5)
+    if not predictions:
+        return []
+    shortcode = post.get("shortcode") or "unknown"
+    relevant: list[dict] = []
+    for pred in predictions:
+        conf = float(pred.get("confidence", 0.0))
+        if conf < _GEOCLIP_MIN_CONFIDENCE:
+            continue
+        relevant.append(
+            {
+                "type": "geoclip_prediction",
+                "description": (
+                    f"GeoCLIP top prediction at "
+                    f"({pred['lat']:.4f}, {pred['lon']:.4f})"
+                ),
+                "location_hint": f"{pred['lat']:.4f}, {pred['lon']:.4f}",
+                "confidence": conf,
+                "shortcode": shortcode,
+                "lat": pred["lat"],
+                "lon": pred["lon"],
+            }
+        )
+    return relevant
+
+
+async def _process_post(
+    session: SessionState, post: dict
+) -> list[dict]:
+    """Run every channel for one post and return the signal list it produced."""
+    image_url = post.get("image_url")
+    if not image_url:
+        return []
+
+    downloader = session.data.get("image_downloader")
+    if downloader is None:
+        return []
+
+    try:
+        image_bytes, media_type = await downloader.download(image_url)
+    except Exception:
+        return []
+
+    signals: list[dict] = []
+
+    # Channel 1 — EXIF GPS. If present, also feed the aggregator.
+    coords = await asyncio.to_thread(_extract_gps_sync, image_bytes)
+    if coords is not None:
+        lat, lon = coords
+        shortcode = post.get("shortcode") or "unknown"
+        finding = Finding(
+            source="exif_gps",
+            evidence_chain=[
+                f"Post: {_shortcode_url(shortcode)}",
+                "EXIF GPSInfo present in uploaded image",
+                f"Decoded coordinates: {lat:.6f}, {lon:.6f}",
+            ],
+            confidence=0.95,
+            risk_level="CRITICAL",
+            remediation=(
+                "Strip EXIF data before posting. Go to Instagram Settings > "
+                "Privacy > remove location data from posts. Delete and "
+                f"re-upload post {_shortcode_url(shortcode)}"
+            ),
+            metadata={"lat": lat, "lon": lon, "shortcode": shortcode},
+        )
+        await _emit_finding(session, finding)
+        signals.append(
+            {
+                "type": "exif_gps",
+                "description": "EXIF GPS coordinates",
+                "location_hint": f"{lat:.4f}, {lon:.4f}",
+                "confidence": 0.95,
+                "shortcode": shortcode,
+                "lat": lat,
+                "lon": lon,
+            }
+        )
+
+    # Channel 2 — Instagram location tag.
+    tag_signal = await _process_location_tag(session, post)
+    if tag_signal is not None:
+        signals.append(tag_signal)
+
+    # Channel 3 — VLM analysis.
+    vlm_signals = await _process_vlm(session, post, image_bytes, media_type)
+    signals.extend(vlm_signals)
+
+    # Channel 4 — GeoCLIP.
+    geoclip_signals = await _process_geoclip(session, post, image_bytes)
+    signals.extend(geoclip_signals)
+
+    return signals
+
+
+# ---------------------------------------------------------------------------
+# Aggregation pass.
+# ---------------------------------------------------------------------------
+
+
+async def _run_aggregation(
+    session: SessionState, all_signals: list[dict]
+) -> None:
+    settings = get_settings()
+    cost_tracker = session.data.get("cost_tracker")
+    anthropic = session.data.get("anthropic")
+    if anthropic is None or not settings.anthropic_api_key:
+        return
+    if cost_tracker is not None and not cost_tracker.can_spend(
+        _SONNET_AGGREGATION_COST_GUESS
+    ):
+        return
+
+    user_prompt = (
+        "Signals collected from the target's recent Instagram posts. Each "
+        "signal links back to a single shortcode so you can correlate. "
+        "Identify the most likely cities/regions and rank by confidence.\n\n"
+        + json.dumps(all_signals, indent=2, ensure_ascii=False)
+    )
+
+    try:
+        text, usage = await anthropic.call_text(
+            model=settings.anthropic_sonnet_model,
+            system=_AGGREGATOR_SYSTEM_PROMPT,
+            user_content=user_prompt,
+            max_tokens=1500,
+            response_json=True,
+        )
+    except Exception:
+        return
+
+    if cost_tracker is not None:
+        cost_tracker.record_anthropic(usage, scope="geolocation")
+        await _emit_cost(session)
+
+    parsed = _parse_json_response(text)
+    if parsed is None:
+        return
+
+    clusters = parsed.get("clusters") or []
+    if not isinstance(clusters, list):
+        return
+
+    for cluster in clusters:
+        if not isinstance(cluster, dict):
+            continue
+        try:
+            confidence = float(cluster.get("confidence", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            confidence = 0.0
+        if confidence < _CLUSTER_EMIT_THRESHOLD:
+            continue
+        region = str(cluster.get("region", "") or "").strip()
+        if not region:
+            continue
+        evidence_raw = cluster.get("evidence") or []
+        evidence_lines = [str(e) for e in evidence_raw if e]
+        risk_level_raw = str(cluster.get("risk_level", "MEDIUM") or "MEDIUM").upper()
+        if risk_level_raw not in {"LOW", "MEDIUM", "HIGH", "CRITICAL"}:
+            risk_level_raw = "MEDIUM"
+
+        evidence_chain = [
+            f"Aggregated region: {region}",
+            f"Cluster confidence: {confidence:.2f}",
+        ] + [f"Evidence: {line}" for line in evidence_lines]
+
+        finding = Finding(
+            source="geo_aggregation",
+            evidence_chain=evidence_chain,
+            confidence=max(0.0, min(1.0, confidence)),
+            risk_level=risk_level_raw,  # type: ignore[arg-type]
+            remediation=(
+                f"Multiple posts cluster around {region}. Audit recent posts "
+                "for tagged locations, recognizable backgrounds, and EXIF "
+                "metadata; remove or crop content that pinpoints this area."
+            ),
+            metadata={
+                "region": region,
+                "evidence": evidence_lines,
+                "cluster_confidence": confidence,
+            },
+        )
+        await _emit_finding(session, finding)
+
+
+# ---------------------------------------------------------------------------
+# Entry point.
+# ---------------------------------------------------------------------------
+
+
+async def run(session: SessionState) -> None:
+    await session.publish_event(_pipeline_status_event(_PIPELINE, "running"))
+
+    try:
+        posts: list[dict] = list(session.data.get("posts") or [])
+        image_posts = [p for p in posts if not p.get("is_video")]
+        image_posts = image_posts[:_MAX_POSTS]
+
+        cost_tracker = session.data.get("cost_tracker")
+        all_signals: list[dict] = []
+        budget_exceeded = False
+
+        for post in image_posts:
+            if cost_tracker is not None and not cost_tracker.can_spend(
+                _HAIKU_VISION_COST_GUESS
+            ):
+                budget_exceeded = True
+                break
+            try:
+                signals = await _process_post(session, post)
+            except Exception:
+                # One bad post should never abort the pipeline.
+                continue
+            all_signals.extend(signals)
+
+        if budget_exceeded:
+            await session.publish_event(
+                _pipeline_status_event(
+                    _PIPELINE,
+                    "budget_exceeded",
+                    "Geolocation pipeline halted before all posts processed.",
+                )
+            )
+            return
+
+        if len(all_signals) >= _MIN_SIGNALS_FOR_AGGREGATION:
+            await _run_aggregation(session, all_signals)
+
+        await session.publish_event(_pipeline_status_event(_PIPELINE, "complete"))
+    except Exception as exc:  # noqa: BLE001 — defensive top-level guard
+        await session.publish_event(
+            _pipeline_status_event(_PIPELINE, "error", f"{type(exc).__name__}: {exc}")
+        )

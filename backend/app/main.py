@@ -1,25 +1,74 @@
+"""FastAPI entrypoint for NODOXX."""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.routes.audit import router as audit_router
-from app.api.routes.auth import router as auth_router
-from app.api.routes.health import router as health_router
-from app.api.routes.session import router as session_router
-from app.core.config import get_settings
+from app.config import get_settings
+from app.routes.audit import router as audit_router
+from app.routes.profile import router as profile_router
+from app.routes.stream import router as stream_router
+from app.session_store import SESSIONS, gc_loop
 
-settings = get_settings()
+logger = logging.getLogger("nodoxx")
 
-app = FastAPI(title=settings.app_name)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[str(settings.frontend_url).rstrip("/")],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    settings = get_settings()
+    gc_task = asyncio.create_task(
+        gc_loop(ttl_minutes=settings.session_ttl_minutes), name="session-gc"
+    )
+    try:
+        yield
+    finally:
+        gc_task.cancel()
+        try:
+            await gc_task
+        except asyncio.CancelledError:
+            pass
+        # Best-effort cleanup of any remaining session http clients.
+        for sid in list(SESSIONS.keys()):
+            state = SESSIONS.pop(sid, None)
+            if state is None:
+                continue
+            for task in state.audit_tasks.values():
+                if not task.done():
+                    task.cancel()
+            http = state.data.get("http")
+            if http is not None:
+                try:
+                    await http.aclose()
+                except Exception:
+                    pass
 
-app.include_router(health_router, prefix="/api")
-app.include_router(audit_router, prefix="/api")
-app.include_router(auth_router, prefix="/api")
-app.include_router(session_router, prefix="/api")
+
+def create_app() -> FastAPI:
+    settings = get_settings()
+    app = FastAPI(title="NODOXX", version="0.1.0", lifespan=lifespan)
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=[settings.frontend_url.rstrip("/")],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    app.include_router(profile_router, prefix="/api")
+    app.include_router(audit_router, prefix="/api")
+    app.include_router(stream_router, prefix="/api")
+
+    @app.get("/api/health")
+    async def health() -> dict:
+        return {"status": "ok"}
+
+    return app
+
+
+app = create_app()

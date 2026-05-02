@@ -1,1 +1,1 @@
-
+"""Shared services package."""
