@@ -46,36 +46,22 @@ export default function AuditHeader({
 
 function ProfileBlock({ profile }: { profile: Profile }) {
   return (
-    <div className="flex min-w-0 items-center gap-3">
-      <img
-        src={profile.profile_pic_url}
-        alt=""
-        referrerPolicy="no-referrer"
-        className="h-10 w-10 flex-shrink-0 border border-kali-border bg-kali-surface object-cover grayscale"
-        onError={(e) => {
-          (e.currentTarget as HTMLImageElement).style.visibility = "hidden";
-        }}
-      />
-      <div className="flex min-w-0 flex-col leading-tight">
-        <span className="truncate font-mono text-[13px] text-kali-text">
-          @{profile.username}
-        </span>
-        <span className="font-mono text-[11px] text-kali-dim tabular-nums">
-          {formatCount(profile.followers)} followers
-        </span>
-      </div>
+    <div className="flex min-w-0 flex-col leading-tight">
+      <span className="truncate font-mono text-[13px] text-kali-text">
+        @{profile.username}
+      </span>
+      <span className="font-mono text-[11px] text-kali-dim tabular-nums">
+        {formatCount(profile.followers)} followers
+      </span>
     </div>
   );
 }
 
 function ProfileSkeleton() {
   return (
-    <div className="flex items-center gap-3">
-      <div className="h-10 w-10 animate-running-pulse bg-kali-surface" />
-      <div className="flex flex-col gap-1">
-        <div className="h-3 w-24 animate-running-pulse bg-kali-surface" />
-        <div className="h-2 w-16 animate-running-pulse bg-kali-surface" />
-      </div>
+    <div className="flex flex-col gap-1">
+      <div className="h-3 w-24 animate-running-pulse bg-kali-surface" />
+      <div className="h-2 w-16 animate-running-pulse bg-kali-surface" />
     </div>
   );
 }

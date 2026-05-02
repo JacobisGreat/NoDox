@@ -9,6 +9,7 @@ import {
   PipelineStatusEvent,
   Profile,
 } from "../types";
+import { exposureScoreFromFindings } from "../utils/format";
 import { useSSE } from "./useSSE";
 
 const PIPELINES: PipelineName[] = ["identity", "geolocation", "web_footprint"];
@@ -152,6 +153,22 @@ export function useAudit(sessionId: string | null): AuditState {
     findingsByPipeline.geolocation.length +
     findingsByPipeline.web_footprint.length;
 
+  // Always derive the displayed exposure score from the findings actually
+  // on the page, not whatever the backend (AI or fallback) sent. Keeps
+  // the headline score honest if the AI summarizer is skipped, errors,
+  // or returns a number that doesn't match the rendered findings.
+  const normalizedAggregator = useMemo<AggregatorResult | null>(() => {
+    if (!aggregator) return null;
+    const all: Finding[] = [
+      ...findingsByPipeline.identity,
+      ...findingsByPipeline.geolocation,
+      ...findingsByPipeline.web_footprint,
+    ];
+    const recomputed = exposureScoreFromFindings(all);
+    if (recomputed === aggregator.exposure_score) return aggregator;
+    return { ...aggregator, exposure_score: recomputed };
+  }, [aggregator, findingsByPipeline]);
+
   return {
     profile,
     postCount,
@@ -160,7 +177,7 @@ export function useAudit(sessionId: string | null): AuditState {
     totalFindings,
     cost,
     costTick,
-    aggregator,
+    aggregator: normalizedAggregator,
     streamDone,
     connected,
     startError,

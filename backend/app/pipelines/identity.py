@@ -50,8 +50,8 @@ logger = logging.getLogger(__name__)
 
 PIPELINE_NAME = "identity"
 
-_CONCURRENCY = 30
-_REQUEST_TIMEOUT = httpx.Timeout(8.0, connect=5.0)
+_CONCURRENCY = 60
+_REQUEST_TIMEOUT = httpx.Timeout(5.0, connect=3.0)
 _BODY_SCAN_BYTES = 4000
 # Cap how much of the body we feed into the message-detector. Sherlock
 # scans the entire body but most matches are within the first few KB and
@@ -597,7 +597,7 @@ async def _check_platform(
                 break
             except (httpx.HTTPError, asyncio.TimeoutError) as exc:
                 if attempt == 0:
-                    await asyncio.sleep(1.0 + random.random() * 2.0)
+                    await asyncio.sleep(0.2 + random.random() * 0.3)
                     continue
                 logger.debug("Skipping %s (%s): %s", name, probe_url, exc)
                 return None

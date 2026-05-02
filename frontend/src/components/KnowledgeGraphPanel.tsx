@@ -5,15 +5,14 @@ import {
   KnowledgeGraphData,
   KnowledgeLink,
   KnowledgeNode,
-  KnowledgeNodeKind,
   PipelineName,
   Profile,
   RemediationItem,
-  RiskLevel,
 } from "../types";
 import {
   buildKnowledgeGraph,
   linkKindLabel,
+  nodeIdOf,
   nodeKindLabel,
 } from "../utils/knowledgeGraph";
 import { riskBgClass } from "../utils/format";
@@ -25,84 +24,6 @@ interface Props {
   profile: Profile | null;
   findingsByPipeline: Record<PipelineName, Finding[]>;
   aggregator: AggregatorResult | null;
-}
-
-type FilterKey =
-  | "all"
-  | "identity"
-  | "geolocation"
-  | "web_footprint"
-  | "remediation"
-  | "high";
-
-const FILTERS: { key: FilterKey; label: string }[] = [
-  { key: "all", label: "all" },
-  { key: "identity", label: "identity" },
-  { key: "geolocation", label: "geo" },
-  { key: "web_footprint", label: "web" },
-  { key: "remediation", label: "remediation" },
-  { key: "high", label: "high risk" },
-];
-
-const NEVER_FILTER: KnowledgeNodeKind[] = ["profile", "summary"];
-
-function riskRank(level: RiskLevel | undefined): number {
-  if (level === "CRITICAL") return 4;
-  if (level === "HIGH") return 3;
-  if (level === "MEDIUM") return 2;
-  if (level === "LOW") return 1;
-  return 0;
-}
-
-function applyFilter(
-  data: KnowledgeGraphData,
-  filter: FilterKey,
-): KnowledgeGraphData {
-  if (filter === "all") return data;
-  const keep = new Set<string>();
-  for (const node of data.nodes) {
-    if (NEVER_FILTER.includes(node.kind)) {
-      keep.add(node.id);
-      continue;
-    }
-    if (filter === "high") {
-      if (riskRank(node.risk) >= 3) keep.add(node.id);
-      continue;
-    }
-    if (filter === "remediation") {
-      if (node.kind === "remediation") keep.add(node.id);
-      continue;
-    }
-    if (node.pipeline === filter) {
-      keep.add(node.id);
-      continue;
-    }
-    if (node.kind === "pipeline" && node.pipeline === filter) {
-      keep.add(node.id);
-    }
-  }
-  // Pull in entities adjacent to a kept finding so connections stay visible.
-  for (const link of data.links) {
-    const s =
-      typeof link.source === "string"
-        ? link.source
-        : (link.source as KnowledgeNode).id;
-    const t =
-      typeof link.target === "string"
-        ? link.target
-        : (link.target as KnowledgeNode).id;
-    if (keep.has(s) && data.nodes.some((n) => n.id === t)) keep.add(t);
-    if (keep.has(t) && data.nodes.some((n) => n.id === s)) keep.add(s);
-  }
-  const nodes = data.nodes.filter((n) => keep.has(n.id));
-  const links = data.links.filter((l) => {
-    const s =
-      typeof l.source === "string" ? l.source : (l.source as KnowledgeNode).id;
-    const t =
-      typeof l.target === "string" ? l.target : (l.target as KnowledgeNode).id;
-    return keep.has(s) && keep.has(t);
-  });
-  return { nodes, links };
 }
 
 export default function KnowledgeGraphPanel({
@@ -120,21 +41,14 @@ export default function KnowledgeGraphPanel({
     [profile, findingsByPipeline, aggregator],
   );
 
-  const [filter, setFilter] = useState<FilterKey>("all");
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [hoverId, setHoverId] = useState<string | null>(null);
-  const [freeze, setFreeze] = useState(false);
-
-  const filtered = useMemo(
-    () => applyFilter(fullGraph, filter),
-    [fullGraph, filter],
-  );
 
   const containerRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<KnowledgeGraphCanvasHandle | null>(null);
   const [size, setSize] = useState<{ w: number; h: number }>({
     w: 600,
-    h: 520,
+    h: 620,
   });
 
   useLayoutEffect(() => {
@@ -142,7 +56,7 @@ export default function KnowledgeGraphPanel({
     if (!el) return;
     const update = () => {
       const rect = el.getBoundingClientRect();
-      const desired = window.innerWidth < 640 ? 380 : 520;
+      const desired = window.innerWidth < 640 ? 440 : 620;
       setSize({ w: Math.max(320, Math.floor(rect.width)), h: desired });
     };
     update();
@@ -153,8 +67,8 @@ export default function KnowledgeGraphPanel({
 
   useEffect(() => {
     if (!selectedId) return;
-    if (!filtered.nodes.some((n) => n.id === selectedId)) setSelectedId(null);
-  }, [filtered, selectedId]);
+    if (!fullGraph.nodes.some((n) => n.id === selectedId)) setSelectedId(null);
+  }, [fullGraph, selectedId]);
 
   const selectedNode =
     selectedId === null
@@ -164,21 +78,20 @@ export default function KnowledgeGraphPanel({
   const incidentLinks = useMemo<KnowledgeLink[]>(() => {
     if (!selectedId) return [];
     return fullGraph.links.filter((l) => {
-      const s =
-        typeof l.source === "string"
-          ? l.source
-          : (l.source as KnowledgeNode).id;
-      const t =
-        typeof l.target === "string"
-          ? l.target
-          : (l.target as KnowledgeNode).id;
+      const s = nodeIdOf(l.source);
+      const t = nodeIdOf(l.target);
       return s === selectedId || t === selectedId;
     });
   }, [fullGraph, selectedId]);
 
-  if (totalFindings === 0 && !aggregator) {
-    return null;
-  }
+  if (totalFindings === 0 && !aggregator) return null;
+
+  const handleSelect = (id: string | null) => {
+    setSelectedId((prev) => {
+      if (id === null) return null;
+      return prev === id ? null : id;
+    });
+  };
 
   return (
     <section className="border border-kali-border bg-kali-surface transition-colors hover:border-kali-text">
@@ -191,48 +104,28 @@ export default function KnowledgeGraphPanel({
             {fullGraph.nodes.length} nodes
           </span>
         </div>
-        <div className="flex flex-wrap items-center gap-1.5">
-          {FILTERS.map((f) => {
-            const active = f.key === filter;
-            return (
-              <button
-                key={f.key}
-                type="button"
-                onClick={() => setFilter(f.key)}
-                className={`border px-2.5 py-1 font-mono text-[10px] uppercase tracking-label transition-colors ${
-                  active
-                    ? "border-kali-text bg-kali-text text-kali-bg"
-                    : "border-kali-border text-kali-dim hover:border-kali-text hover:text-kali-text"
-                }`}
-              >
-                {f.label}
-              </button>
-            );
-          })}
-        </div>
       </header>
 
       <div className="grid grid-cols-1 gap-0 lg:grid-cols-[minmax(0,1fr)_320px]">
         <div
           ref={containerRef}
           className="relative bg-kali-bg lg:border-r lg:border-kali-border"
-          style={{ minHeight: 380 }}
+          style={{ minHeight: 460 }}
         >
-          {filtered.nodes.length === 0 ? (
-            <div className="flex h-[380px] items-center justify-center font-mono text-[11px] text-kali-dim">
-              no nodes match this filter
+          {fullGraph.nodes.length === 0 ? (
+            <div className="flex h-[460px] items-center justify-center font-mono text-[11px] text-kali-dim">
+              no nodes yet
             </div>
           ) : (
             <KnowledgeGraphCanvas
               ref={canvasRef}
-              data={filtered}
+              data={fullGraph}
               width={size.w}
               height={size.h}
               selectedId={selectedId}
               hoverId={hoverId}
-              onSelect={setSelectedId}
+              onSelect={handleSelect}
               onHover={setHoverId}
-              freeze={freeze}
             />
           )}
 
@@ -251,19 +144,6 @@ export default function KnowledgeGraphPanel({
             </ToolbarButton>
             <ToolbarButton onClick={() => canvasRef.current?.recenter()}>
               fit
-            </ToolbarButton>
-            <ToolbarButton
-              active={freeze}
-              onClick={() => {
-                if (freeze) {
-                  canvasRef.current?.releasePins();
-                  setFreeze(false);
-                } else {
-                  setFreeze(true);
-                }
-              }}
-            >
-              {freeze ? "frozen" : "freeze"}
             </ToolbarButton>
           </div>
         </div>
@@ -329,10 +209,8 @@ function DetailPanel({ node, links, allNodes }: DetailProps) {
   }
 
   const incident = links.map((l) => {
-    const sId =
-      typeof l.source === "string" ? l.source : (l.source as KnowledgeNode).id;
-    const tId =
-      typeof l.target === "string" ? l.target : (l.target as KnowledgeNode).id;
+    const sId = nodeIdOf(l.source) ?? "";
+    const tId = nodeIdOf(l.target) ?? "";
     const otherId = sId === node.id ? tId : sId;
     const other = allNodes.find((n) => n.id === otherId);
     return { link: l, other };
@@ -367,9 +245,7 @@ function DetailPanel({ node, links, allNodes }: DetailProps) {
 
       {node.kind === "finding" && node.metadata && (
         <FindingDetail
-          finding={
-            (node.metadata as { _finding?: Finding })._finding ?? null
-          }
+          finding={(node.metadata as { _finding?: Finding })._finding ?? null}
         />
       )}
 

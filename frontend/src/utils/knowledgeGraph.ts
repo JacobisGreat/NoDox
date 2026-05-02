@@ -459,6 +459,63 @@ export function buildKnowledgeGraph({
   };
 }
 
+// Shared helper — knowledge-graph link source/target may be a string id or
+// a node object reference (d3-force mutates them post-tick).
+export function nodeIdOf(
+  ref: string | number | { id?: string | number } | undefined,
+): string | null {
+  if (ref == null) return null;
+  if (typeof ref === "string") return ref;
+  if (typeof ref === "number") return String(ref);
+  if (typeof ref.id === "string") return ref.id;
+  if (typeof ref.id === "number") return String(ref.id);
+  return null;
+}
+
+// Returns the parent (containing) node id for a finding/entity, used for
+// expand/collapse semantics and parent-anchored spawn positions.
+export function parentNodeId(
+  nodeId: string,
+  links: readonly KnowledgeLink[],
+): string | null {
+  for (const link of links) {
+    const t = nodeIdOf(link.target);
+    if (t !== nodeId) continue;
+    const s = nodeIdOf(link.source);
+    if (!s) continue;
+    if (
+      link.kind === "contains" ||
+      link.kind === "references" ||
+      link.kind === "located_at" ||
+      link.kind === "suggests"
+    ) {
+      return s;
+    }
+  }
+  return null;
+}
+
+// Count of children attached to `nodeId` via expand-relevant link kinds.
+export function childCountFor(
+  nodeId: string,
+  links: readonly KnowledgeLink[],
+): number {
+  let n = 0;
+  for (const link of links) {
+    const s = nodeIdOf(link.source);
+    if (s !== nodeId) continue;
+    if (
+      link.kind === "contains" ||
+      link.kind === "references" ||
+      link.kind === "located_at" ||
+      link.kind === "suggests"
+    ) {
+      n += 1;
+    }
+  }
+  return n;
+}
+
 export function nodeKindLabel(kind: KnowledgeNodeKind): string {
   switch (kind) {
     case "profile": return "profile";

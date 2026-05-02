@@ -36,7 +36,7 @@ class TrafilaturaFetcher:
         try:
             resp = await self._http.get(
                 url,
-                timeout=httpx.Timeout(10.0, connect=10.0),
+                timeout=httpx.Timeout(5.0, connect=3.0),
                 follow_redirects=True,
                 headers={"user-agent": _DEFAULT_USER_AGENT},
             )

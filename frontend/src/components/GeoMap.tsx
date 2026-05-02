@@ -196,11 +196,36 @@ function collectSignals(findings: Finding[]): RawSignal[] {
   return out;
 }
 
+const CLUSTER_RADIUS_KM = 75;
+
+function densestCluster(points: GeoPoint[]): GeoPoint[] {
+  if (points.length <= 1) return points;
+  // Pick the seed point whose CLUSTER_RADIUS_KM neighborhood carries the
+  // most weighted signal, then return the points inside that neighborhood.
+  let bestIndex = 0;
+  let bestWeight = -1;
+  for (let i = 0; i < points.length; i++) {
+    let w = 0;
+    for (let j = 0; j < points.length; j++) {
+      if (haversineKm(points[i], points[j]) <= CLUSTER_RADIUS_KM) {
+        w += (points[j].confidence + 0.1) * categoryWeight(points[j].category);
+      }
+    }
+    if (w > bestWeight) {
+      bestWeight = w;
+      bestIndex = i;
+    }
+  }
+  const seed = points[bestIndex];
+  return points.filter((p) => haversineKm(p, seed) <= CLUSTER_RADIUS_KM);
+}
+
 function computeCentroid(points: GeoPoint[]): Centroid | null {
   if (points.length === 0) return null;
 
   const imagePoints = points.filter((p) => p.category !== "tag");
-  const usePoints = imagePoints.length > 0 ? imagePoints : points;
+  const preferred = imagePoints.length > 0 ? imagePoints : points;
+  const usePoints = densestCluster(preferred);
   const tagFallback = imagePoints.length === 0;
 
   let totalW = 0;

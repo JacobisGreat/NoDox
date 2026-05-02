@@ -38,9 +38,14 @@ interface SceneRefs {
   pointer: THREE.Vector2;
   hoveredKey: string | null;
   initialAimDone: boolean;
+  targetCamDir: THREE.Vector3 | null;
+  lastInteractAt: number;
   rafId: number;
   destroyed: boolean;
 }
+
+const DRIFT_DELAY_MS = 1200;
+const DRIFT_LERP = 0.025;
 
 function latLonToVec3(lat: number, lon: number, r: number): THREE.Vector3 {
   const phi = (90 - lat) * (Math.PI / 180);
@@ -287,10 +292,12 @@ export default function Globe({ points, centroid, height = 460 }: Props) {
     let isInteracting = false;
     controls.addEventListener("start", () => {
       isInteracting = true;
+      if (refs.current) refs.current.lastInteractAt = performance.now();
       renderer.domElement.style.cursor = "grabbing";
     });
     controls.addEventListener("end", () => {
       isInteracting = false;
+      if (refs.current) refs.current.lastInteractAt = performance.now();
       renderer.domElement.style.cursor = "grab";
     });
 
@@ -311,9 +318,31 @@ export default function Globe({ points, centroid, height = 460 }: Props) {
     let rafId = 0;
     function animate() {
       const t = clock.getElapsedTime();
+      const r0 = refs.current;
 
-      // Subtle idle rotation when user not interacting
-      if (!isInteracting) {
+      // Camera drift-back: when there's a target direction and the user has
+      // been still for a moment, slerp the camera back toward the focus point.
+      // Preserve their zoom (camera distance from origin).
+      if (
+        r0 &&
+        r0.targetCamDir &&
+        !isInteracting &&
+        performance.now() - r0.lastInteractAt > DRIFT_DELAY_MS
+      ) {
+        const distance = camera.position.length();
+        const currentDir = camera.position.clone().normalize();
+        const blended = currentDir
+          .lerp(r0.targetCamDir, DRIFT_LERP)
+          .normalize();
+        // Only apply if it actually moves something (avoid jitter at rest).
+        if (blended.distanceToSquared(currentDir) > 1e-8) {
+          camera.position.copy(blended).multiplyScalar(distance);
+          camera.lookAt(0, 0, 0);
+        }
+      }
+
+      // Subtle idle rotation only when there's nothing to focus on yet.
+      if (!isInteracting && !(r0 && r0.targetCamDir)) {
         earthGroup.rotation.y += 0.0006;
       }
 
@@ -398,6 +427,8 @@ export default function Globe({ points, centroid, height = 460 }: Props) {
       pointer,
       hoveredKey: null,
       initialAimDone: false,
+      targetCamDir: null,
+      lastInteractAt: 0,
       rafId,
       destroyed: false,
     };
@@ -514,7 +545,11 @@ export default function Globe({ points, centroid, height = 460 }: Props) {
       r.centroidGroup.add(ring);
     }
 
-    // First-time camera aim only — don't rip the camera around mid-audit
+    // Store the unit direction the camera should drift toward whenever it
+    // wanders. Re-runs whenever the centroid moves (new dominant cluster).
+    r.targetCamDir = latLonToVec3(centroid.lat, centroid.lon, 1).normalize();
+
+    // First-time camera aim only — drift handles every subsequent retarget.
     if (!r.initialAimDone) {
       const camPos = latLonToVec3(centroid.lat, centroid.lon, 2.7);
       r.camera.position.copy(camPos);

@@ -27,7 +27,7 @@ class SerperClient:
     """Thin async wrapper around the Serper /search endpoint."""
 
     _ENDPOINT = "https://google.serper.dev/search"
-    _MIN_INTERVAL_SECONDS = 0.2
+    _MIN_INTERVAL_SECONDS = 0.05
 
     def __init__(self, api_key: str, http: httpx.AsyncClient) -> None:
         self.api_key = api_key

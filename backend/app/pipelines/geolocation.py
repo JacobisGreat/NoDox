@@ -55,7 +55,7 @@ except ImportError:  # pragma: no cover — declared in requirements.txt
 
 
 _PIPELINE = "geolocation"
-_MAX_POSTS = 20
+_MAX_POSTS = 12
 _MIN_SIGNALS_FOR_AGGREGATION = 3
 _GEOCLIP_MIN_CONFIDENCE = 0.10
 _GEOCLIP_FINDING_THRESHOLD = 0.20
@@ -440,7 +440,12 @@ async def _process_vlm(
     anthropic = session.data.get("anthropic")
     sem: asyncio.Semaphore | None = session.data.get("vision_semaphore")
 
-    if anthropic is None or not settings.gemini_api_key:
+    # Either AI provider satisfies this gate. Previously this only
+    # checked GEMINI_API_KEY which silently disabled vision when only
+    # ANTHROPIC_API_KEY was configured.
+    if anthropic is None or not (
+        settings.anthropic_api_key or settings.gemini_api_key
+    ):
         return []
     if cost_tracker is not None and not cost_tracker.can_spend(
         _HAIKU_VISION_COST_GUESS
@@ -449,7 +454,7 @@ async def _process_vlm(
 
     shortcode = post.get("shortcode") or "unknown"
 
-    async def _call() -> tuple[str, dict] | None:
+    async def _call() -> tuple[tuple[str, dict] | None, str | None]:
         try:
             return await anthropic.call_vision(
                 model=settings.gemini_fast_model,
@@ -461,17 +466,30 @@ async def _process_vlm(
                     "for any location signals. Return JSON only."
                 ),
                 max_tokens=1024,
-            )
-        except Exception:
-            return None
+            ), None
+        except Exception as exc:
+            return None, f"{type(exc).__name__}: {exc}"
 
     if sem is not None:
         async with sem:
-            result = await _call()
+            result, err = await _call()
     else:
-        result = await _call()
+        result, err = await _call()
 
     if result is None:
+        # Surface the reason so the user can tell "no findings because
+        # nothing in the image" from "no findings because every vision
+        # call 400'd". Once-per-pipeline guard avoids spamming the
+        # status feed for every image when the same error repeats.
+        if err and not session.data.get("_vlm_error_logged"):
+            session.data["_vlm_error_logged"] = True
+            await session.publish_event(
+                _pipeline_status_event(
+                    _PIPELINE,
+                    "running",
+                    f"Vision landmark scan unavailable: {err}",
+                )
+            )
         return []
     text, usage = result
     if cost_tracker is not None:
@@ -894,7 +912,7 @@ async def _run_aggregation(
     settings = get_settings()
     cost_tracker = session.data.get("cost_tracker")
     anthropic = session.data.get("anthropic")
-    if anthropic is None or not settings.gemini_api_key:
+    if anthropic is None or not (settings.anthropic_api_key or settings.gemini_api_key):
         return
     if cost_tracker is not None and not cost_tracker.can_spend(
         _SONNET_AGGREGATION_COST_GUESS

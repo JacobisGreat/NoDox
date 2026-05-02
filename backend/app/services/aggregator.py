@@ -8,6 +8,7 @@ frontend dashboard.
 from __future__ import annotations
 
 import json
+import math
 from typing import Any
 
 from app.config import get_settings
@@ -18,7 +19,7 @@ from app.session_store import SessionState
 _SYSTEM_PROMPT = """\
 You are a privacy risk analyst for NODOXX, a consent-based Instagram OSINT
 self-audit tool. The user has audited their own public presence. Produce a
-structured, actionable risk assessment they can act on within 30 minutes.
+structured, actionable next-steps plan they can act on within 30 minutes.
 
 Respond with valid JSON only — no prose, no markdown fences.
 
@@ -29,7 +30,7 @@ Output schema:
   "remediation_list": [
     {
       "priority": <integer starting at 1>,
-      "action": "<concrete action that names a specific URL, settings path, or account>",
+      "action": "<numbered, multi-step instructions>",
       "reason": "<one sentence citing the specific evidence>",
       "risk_level": "<HIGH|MEDIUM|LOW>"
     }
@@ -42,13 +43,25 @@ Exposure score weighting (sum of weighted sub-scores, clamped 0-100):
 - web footprint findings: 0.15
 - weak / low-confidence signals: 0.10
 
-Remediation rules:
-- Every action MUST name a concrete surface: a specific post URL to delete,
-  a specific settings path to change, a specific account to lock, a specific
-  password to rotate. "Improve your privacy" is INVALID.
-- Deduplicate: merge two findings that point to the same action; keep the
+Action-string rules (this is what the user reads — make it walk them through it):
+- Write 'action' as a numbered, step-by-step plan they can copy and follow.
+  Format example:
+  "1) Open https://instagram.com/accounts/edit and switch your account to private.
+   2) Tap your profile picture, choose Edit Picture, and remove the current avatar.
+   3) Confirm the change and check that the profile no longer appears at https://instagram.com/<username>."
+- Each step starts with a verb (Open, Tap, Sign in, Click, Delete, Rotate, Submit).
+- Include the EXACT URLs, menu paths ("Settings → Privacy → Account Privacy"),
+  account names, post shortcodes, or email addresses pulled from the evidence
+  — never placeholders like <username>, [your account], or "the affected page".
+- Aim for 2-5 steps per action. If a finding genuinely needs only one step,
+  one numbered step is fine; do not pad.
+- End with a verification step where it makes sense ("Reload the page and
+  confirm it now returns 404").
+- Plain text only, no markdown bullets, asterisks, or bold. Use newlines
+  between numbered steps.
+- Deduplicate: merge two findings that target the same surface; keep the
   higher risk_level.
-- Sort the list so priority 1 is the single highest-impact step."""
+- Sort so priority 1 is the single highest-impact step the user should do first."""
 
 
 def _group_by_pipeline(findings: list[dict]) -> dict[str, list[dict]]:
@@ -84,14 +97,30 @@ def _build_user_prompt(
     return "\n".join(parts)
 
 
+def _exposure_score_from_findings(findings: list[dict]) -> int:
+    """Severity-weighted exposure score with diminishing returns.
+
+    Each finding contributes points by risk_level; the total is squashed
+    through 100 * (1 - exp(-points / divisor)) so a flood of LOWs can't
+    dominate a few CRITICALs and a single CRITICAL doesn't pin to 100.
+    Tuned so 1 HIGH ~ 33, 1 CRITICAL ~ 49, 3 CRITICAL ~ 87.
+    """
+    weights = {"CRITICAL": 30.0, "HIGH": 18.0, "MEDIUM": 6.0, "LOW": 1.5}
+    points = 0.0
+    for f in findings:
+        risk = (f.get("risk_level") or "LOW").upper()
+        points += weights.get(risk, 1.5)
+    if points <= 0:
+        return 0
+    score = 100.0 * (1.0 - math.exp(-points / 45.0))
+    return max(0, min(100, int(round(score))))
+
+
 def _fallback_report(findings: list[dict], reason: str) -> dict[str, Any]:
     if not findings:
         return {
             "exposure_score": 0,
-            "summary": (
-                "No risk signals were collected during this audit. "
-                f"Aggregator note: {reason}"
-            ),
+            "summary": "No risk signals were collected during this audit.",
             "remediation_list": [],
         }
     seen: dict[str, dict[str, Any]] = {}
@@ -121,14 +150,14 @@ def _fallback_report(findings: list[dict], reason: str) -> dict[str, Any]:
         }
         for idx, item in enumerate(items[:15])
     ]
-    high_count = sum(1 for f in findings if (f.get("risk_level") or "").upper() in {"HIGH", "CRITICAL"})
-    score = min(100, 25 + 5 * len(findings) + 8 * high_count)
+    high_count = sum(
+        1 for f in findings if (f.get("risk_level") or "").upper() in {"HIGH", "CRITICAL"}
+    )
     return {
-        "exposure_score": int(score),
+        "exposure_score": _exposure_score_from_findings(findings),
         "summary": (
             f"Collected {len(findings)} risk signal(s) across the pipelines, "
-            f"including {high_count} high-severity item(s). "
-            f"Aggregator note: {reason}"
+            f"including {high_count} high-severity item(s)."
         ),
         "remediation_list": remediation_list,
     }
@@ -201,8 +230,8 @@ async def run(session: SessionState) -> None:
         )
         return
 
-    if not settings.gemini_api_key:
-        report = _fallback_report(findings, "GEMINI_API_KEY not configured")
+    if not (settings.anthropic_api_key or settings.gemini_api_key):
+        report = _fallback_report(findings, "AI summarizer not configured")
         await session.publish_event(
             _aggregator_done_event(
                 report["exposure_score"], report["summary"], report["remediation_list"]
@@ -213,7 +242,7 @@ async def run(session: SessionState) -> None:
     cost_tracker = session.data.get("cost_tracker")
     anthropic = session.data.get("anthropic")
     if anthropic is None:
-        report = _fallback_report(findings, "Gemini client unavailable")
+        report = _fallback_report(findings, "AI summarizer unavailable")
         await session.publish_event(
             _aggregator_done_event(
                 report["exposure_score"], report["summary"], report["remediation_list"]
@@ -254,8 +283,8 @@ async def run(session: SessionState) -> None:
                 max_tokens=4096,
                 response_json=True,
             )
-    except Exception as exc:
-        report = _fallback_report(findings, f"aggregator call failed: {exc}")
+    except Exception:
+        report = _fallback_report(findings, "summary unavailable")
         await session.publish_event(
             _aggregator_done_event(
                 report["exposure_score"], report["summary"], report["remediation_list"]

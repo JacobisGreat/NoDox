@@ -186,6 +186,123 @@ def _session_cookies() -> dict[str, str] | None:
     return cookies
 
 
+_USER_FEED_URL = "https://i.instagram.com/api/v1/feed/user/{user_id}/?count={count}"
+
+
+def _post_from_feed_item(item: dict[str, Any]) -> InstagramPost | None:
+    """Map a mobile-API feed item to InstagramPost.
+
+    The mobile feed shape is different from the web GraphQL shape used
+    inside ``web_profile_info``. Carousels (media_type=8) put the first
+    image inside ``carousel_media[0]``; reels (media_type=2 with
+    ``product_type='clips'``) still expose a poster frame in
+    ``image_versions2``.
+    """
+    if not isinstance(item, dict):
+        return None
+    code = item.get("code") or ""
+    if not code:
+        return None
+    media_type = item.get("media_type")
+    is_video = media_type == 2
+
+    def _first_image(node: dict[str, Any]) -> str:
+        iv2 = node.get("image_versions2") or {}
+        cands = iv2.get("candidates") or []
+        if cands and isinstance(cands[0], dict):
+            return str(cands[0].get("url") or "")
+        return ""
+
+    image_url = ""
+    if media_type == 8:  # carousel
+        carousel = item.get("carousel_media") or []
+        if carousel:
+            image_url = _first_image(carousel[0])
+    if not image_url:
+        image_url = _first_image(item)
+    if not image_url:
+        return None
+
+    caption_obj = item.get("caption")
+    caption = None
+    if isinstance(caption_obj, dict):
+        text = caption_obj.get("text")
+        if isinstance(text, str) and text.strip():
+            caption = text
+
+    loc_obj = item.get("location")
+    location_name: str | None = None
+    location_id: int | None = None
+    if isinstance(loc_obj, dict):
+        if isinstance(loc_obj.get("name"), str):
+            location_name = loc_obj["name"]
+        raw_id = loc_obj.get("pk") or loc_obj.get("id")
+        if raw_id is not None:
+            try:
+                location_id = int(raw_id)
+            except (TypeError, ValueError):
+                location_id = None
+
+    tagged: list[str] = []
+    usertags = item.get("usertags")
+    if isinstance(usertags, dict):
+        for entry in usertags.get("in") or []:
+            user = (entry or {}).get("user") if isinstance(entry, dict) else None
+            uname = (user or {}).get("username") if isinstance(user, dict) else None
+            if isinstance(uname, str) and uname:
+                tagged.append(uname)
+
+    ts = item.get("taken_at")
+    taken_at_iso = ""
+    if isinstance(ts, (int, float)):
+        try:
+            taken_at_iso = datetime.fromtimestamp(int(ts), tz=timezone.utc).isoformat()
+        except (OverflowError, OSError, ValueError):
+            taken_at_iso = ""
+
+    return InstagramPost(
+        shortcode=str(code),
+        image_url=image_url,
+        caption=caption,
+        location_name=location_name,
+        location_id=location_id,
+        taken_at_iso=taken_at_iso,
+        is_video=is_video,
+        tagged_users=tagged,
+    )
+
+
+def _fetch_user_feed_sync(
+    client: httpx.Client, user_id: str, max_posts: int
+) -> list[InstagramPost]:
+    """Fallback when web_profile_info returns 0 inline edges.
+
+    Meta has progressively trimmed the inline timeline payload on
+    ``web_profile_info``, so for cookie-authenticated callers we follow
+    up with the mobile feed endpoint to actually see the user's posts.
+    """
+    url = _USER_FEED_URL.format(user_id=user_id, count=max(max_posts, 12))
+    try:
+        resp = client.get(url)
+    except httpx.HTTPError:
+        return []
+    if resp.status_code != 200:
+        return []
+    try:
+        body = resp.json()
+    except ValueError:
+        return []
+    items = (body or {}).get("items") or []
+    out: list[InstagramPost] = []
+    for item in items:
+        if len(out) >= max_posts:
+            break
+        post = _post_from_feed_item(item)
+        if post is not None:
+            out.append(post)
+    return out
+
+
 def _fetch_sync(username: str, max_posts: int) -> FetchResult:
     url = _WEB_PROFILE_INFO_URL.format(username=username)
     try:
@@ -196,52 +313,68 @@ def _fetch_sync(username: str, max_posts: int) -> FetchResult:
             follow_redirects=True,
         ) as client:
             resp = client.get(url)
+
+            status = resp.status_code
+            if status == 404:
+                raise InstaProfileNotFound(f"Profile '{username}' does not exist")
+            if status in (401, 403):
+                raise InstaRateLimited(
+                    f"Instagram refused the anonymous lookup (HTTP {status}); "
+                    "the public endpoint may be temporarily walled."
+                )
+            if status == 429:
+                raise InstaRateLimited("Instagram rate limit (HTTP 429)")
+            if status >= 500:
+                raise InstaRateLimited(f"Instagram upstream error (HTTP {status})")
+            if status != 200:
+                raise InstaFetchError(f"Unexpected HTTP {status} from Instagram")
+
+            try:
+                body = resp.json()
+            except ValueError as exc:
+                raise InstaFetchError(
+                    f"Instagram returned non-JSON body: {exc}"
+                ) from exc
+
+            user = (body or {}).get("data", {}).get("user")
+            if not isinstance(user, dict):
+                raise InstaProfileNotFound(f"Profile '{username}' not visible")
+
+            profile = _profile_from_user(user, requested=username)
+
+            if profile.is_private:
+                return FetchResult(profile=profile, posts=[])
+
+            edges = (
+                (user.get("edge_owner_to_timeline_media") or {}).get("edges")
+            ) or []
+            posts: list[InstagramPost] = []
+            for edge in edges:
+                if len(posts) >= max_posts:
+                    break
+                node = (edge or {}).get("node") if isinstance(edge, dict) else None
+                if not isinstance(node, dict):
+                    continue
+                post = _post_from_node(node)
+                if post is not None:
+                    posts.append(post)
+
+            # Fallback: web_profile_info increasingly returns an empty edges
+            # list even for public accounts with posts. When we have session
+            # cookies and the profile claims posts, hit the mobile user feed
+            # to actually retrieve them.
+            if (
+                not posts
+                and profile.post_count_total > 0
+                and _session_cookies() is not None
+            ):
+                user_id = user.get("id")
+                if user_id:
+                    posts = _fetch_user_feed_sync(client, str(user_id), max_posts)
+
+            return FetchResult(profile=profile, posts=posts)
     except httpx.HTTPError as exc:
         raise InstaFetchError(f"network error: {exc}") from exc
-
-    status = resp.status_code
-    if status == 404:
-        raise InstaProfileNotFound(f"Profile '{username}' does not exist")
-    if status in (401, 403):
-        raise InstaRateLimited(
-            f"Instagram refused the anonymous lookup (HTTP {status}); "
-            "the public endpoint may be temporarily walled."
-        )
-    if status == 429:
-        raise InstaRateLimited("Instagram rate limit (HTTP 429)")
-    if status >= 500:
-        raise InstaRateLimited(f"Instagram upstream error (HTTP {status})")
-    if status != 200:
-        raise InstaFetchError(f"Unexpected HTTP {status} from Instagram")
-
-    try:
-        body = resp.json()
-    except ValueError as exc:
-        raise InstaFetchError(f"Instagram returned non-JSON body: {exc}") from exc
-
-    user = (body or {}).get("data", {}).get("user")
-    if not isinstance(user, dict):
-        # Some cloaked / shadowed profiles come back 200 with user=null.
-        raise InstaProfileNotFound(f"Profile '{username}' not visible")
-
-    profile = _profile_from_user(user, requested=username)
-
-    if profile.is_private:
-        return FetchResult(profile=profile, posts=[])
-
-    edges = ((user.get("edge_owner_to_timeline_media") or {}).get("edges")) or []
-    posts: list[InstagramPost] = []
-    for edge in edges:
-        if len(posts) >= max_posts:
-            break
-        node = (edge or {}).get("node") if isinstance(edge, dict) else None
-        if not isinstance(node, dict):
-            continue
-        post = _post_from_node(node)
-        if post is not None:
-            posts.append(post)
-
-    return FetchResult(profile=profile, posts=posts)
 
 
 async def fetch_profile_and_posts(

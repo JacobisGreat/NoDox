@@ -135,7 +135,7 @@ async def _generate_custom_queries(
     settings = get_settings()
     cost_tracker = session.data.get("cost_tracker")
     anthropic = session.data.get("anthropic")
-    if anthropic is None or not settings.gemini_api_key:
+    if anthropic is None or not (settings.anthropic_api_key or settings.gemini_api_key):
         return []
     if cost_tracker is not None and not cost_tracker.can_spend(
         _SONNET_QUERY_GEN_COST_GUESS, scope=_SCOPE
@@ -195,7 +195,7 @@ async def _triage_result(
     settings = get_settings()
     cost_tracker = session.data.get("cost_tracker")
     anthropic = session.data.get("anthropic")
-    if anthropic is None or not settings.gemini_api_key:
+    if anthropic is None or not (settings.anthropic_api_key or settings.gemini_api_key):
         return None
     if cost_tracker is not None and not cost_tracker.can_spend(
         _HAIKU_TRIAGE_COST_GUESS, scope=_SCOPE
@@ -247,7 +247,7 @@ async def _extract_pii(
     settings = get_settings()
     cost_tracker = session.data.get("cost_tracker")
     anthropic = session.data.get("anthropic")
-    if anthropic is None or not settings.gemini_api_key:
+    if anthropic is None or not (settings.anthropic_api_key or settings.gemini_api_key):
         return []
     if cost_tracker is not None and not cost_tracker.can_spend(
         _HAIKU_EXTRACT_COST_GUESS, scope=_SCOPE

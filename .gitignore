@@ -20,3 +20,6 @@ systems/
 # Local scratch
 tmp/
 Screenshot*.png
+
+# Local-only PII fixtures (never commit real-person enrichment data)
+frontend/src/data/*.local.json

@@ -64,6 +64,10 @@ class Settings:
     gemini_pro_model: str
     gemini_fast_model: str
 
+    # Anthropic (preferred — when ANTHROPIC_API_KEY is set the audit
+    # routes to Claude for every text + vision call instead of Gemini).
+    anthropic_api_key: str
+
     # Serper.dev (web_footprint search backend; replaced Google CSE
     # after Google closed Custom Search JSON API to new accounts in 2026)
     serper_api_key: str
@@ -94,31 +98,45 @@ class Settings:
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
+    anthropic_key = _env_str("ANTHROPIC_API_KEY")
+    # When Anthropic is configured, the model-id fields used by the
+    # call sites resolve to Claude IDs instead of Gemini IDs. Field
+    # names stay "gemini_*" only to avoid touching every pipeline.
+    if anthropic_key:
+        pro_default = "claude-sonnet-4-6"
+        fast_default = "claude-haiku-4-5-20251001"
+    else:
+        pro_default = "gemini-2.5-pro"
+        fast_default = "gemini-2.5-flash"
     return Settings(
         gemini_api_key=_env_str("GEMINI_API_KEY"),
         gemini_api_url=_env_str(
             "GEMINI_API_URL", "https://generativelanguage.googleapis.com/v1beta"
         ),
-        gemini_pro_model=_env_str("GEMINI_PRO_MODEL", "gemini-2.5-pro"),
-        gemini_fast_model=_env_str("GEMINI_FAST_MODEL", "gemini-2.5-flash"),
+        gemini_pro_model=_env_str("GEMINI_PRO_MODEL", pro_default),
+        gemini_fast_model=_env_str("GEMINI_FAST_MODEL", fast_default),
+        anthropic_api_key=anthropic_key,
         serper_api_key=_env_str("SERPER_API_KEY"),
         audit_cost_ceiling_usd=_env_float("AUDIT_COST_CEILING_USD", 1.0),
         web_footprint_budget_share_usd=_env_float(
             "WEB_FOOTPRINT_BUDGET_SHARE_USD", 0.35
         ),
-        web_footprint_max_queries=_env_int("WEB_FOOTPRINT_MAX_QUERIES", 15),
-        web_footprint_max_full_fetches=_env_int("WEB_FOOTPRINT_MAX_FULL_FETCHES", 20),
+        web_footprint_max_queries=_env_int("WEB_FOOTPRINT_MAX_QUERIES", 8),
+        web_footprint_max_full_fetches=_env_int("WEB_FOOTPRINT_MAX_FULL_FETCHES", 10),
+        # Pricing defaults match Claude Sonnet 4.6 (pro) + Haiku 4.5 (fast)
+        # per-million-token rates so the cost ceiling stays accurate after
+        # the Anthropic swap.
         gemini_pro_input_cost_per_million=_env_float(
-            "GEMINI_PRO_INPUT_COST_PER_MILLION", 1.25
+            "GEMINI_PRO_INPUT_COST_PER_MILLION", 3.0
         ),
         gemini_pro_output_cost_per_million=_env_float(
-            "GEMINI_PRO_OUTPUT_COST_PER_MILLION", 10.0
+            "GEMINI_PRO_OUTPUT_COST_PER_MILLION", 15.0
         ),
         gemini_fast_input_cost_per_million=_env_float(
-            "GEMINI_FAST_INPUT_COST_PER_MILLION", 0.30
+            "GEMINI_FAST_INPUT_COST_PER_MILLION", 1.0
         ),
         gemini_fast_output_cost_per_million=_env_float(
-            "GEMINI_FAST_OUTPUT_COST_PER_MILLION", 2.50
+            "GEMINI_FAST_OUTPUT_COST_PER_MILLION", 5.0
         ),
         frontend_url=_env_str("FRONTEND_URL", "http://localhost:5173"),
         session_cookie_name=_env_str("SESSION_COOKIE_NAME", "shieldclaw_session"),

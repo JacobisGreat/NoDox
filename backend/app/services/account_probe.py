@@ -48,8 +48,8 @@ _ALWAYS_INCLUDE = {
 # (Signal's community forum is the canonical example — "Oops!" lives at
 # byte ~11.5k). Scan the first 64 KB; substring search is cheap.
 _BODY_SCAN_BYTES = 65536
-_REQUEST_TIMEOUT = httpx.Timeout(8.0, connect=5.0)
-_DEFAULT_CONCURRENCY = 8
+_REQUEST_TIMEOUT = httpx.Timeout(5.0, connect=3.0)
+_DEFAULT_CONCURRENCY = 16
 
 _HEADERS = {
     "Accept": (

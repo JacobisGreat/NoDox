@@ -1,4 +1,25 @@
-import { PipelineName, RiskLevel } from "../types";
+import { Finding, PipelineName, RiskLevel } from "../types";
+
+const RISK_WEIGHTS: Record<RiskLevel, number> = {
+  CRITICAL: 30,
+  HIGH: 18,
+  MEDIUM: 6,
+  LOW: 1.5,
+};
+
+// Severity-weighted score with diminishing returns. Mirrors the backend
+// fallback formula in services/aggregator.py so the displayed score stays
+// calibrated even when the AI summarizer is skipped or rate-limited.
+export function exposureScoreFromFindings(findings: Finding[]): number {
+  let points = 0;
+  for (const f of findings) {
+    const w = RISK_WEIGHTS[f.risk_level] ?? RISK_WEIGHTS.LOW;
+    points += w;
+  }
+  if (points <= 0) return 0;
+  const raw = 100 * (1 - Math.exp(-points / 45));
+  return Math.max(0, Math.min(100, Math.round(raw)));
+}
 
 const PIPELINE_TITLES: Record<PipelineName, string> = {
   identity: "Identity Cross-Reference",

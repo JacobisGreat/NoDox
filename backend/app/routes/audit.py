@@ -20,6 +20,7 @@ from app.schemas.events import (
     stream_done as _stream_done_event,
 )
 from app.services.aggregator import run as run_aggregator
+from app.services.anthropic_client import AnthropicClient
 from app.services.cost_tracker import CostTracker
 from app.services.gemini_client import GeminiClient
 from app.services.image_downloader import ImageDownloader
@@ -61,14 +62,21 @@ def _build_session_services(session) -> None:
 
     # The dict key stays "anthropic" for back-compat across the pipelines —
     # nothing inside cares about the underlying provider, they just call
-    # ``client.call_text`` / ``client.call_vision``. The actual instance is
-    # now Gemini.
+    # ``client.call_text`` / ``client.call_vision``. We prefer Anthropic
+    # when ANTHROPIC_API_KEY is configured (more reliable, vision-capable),
+    # and fall back to the Gemini client only if Anthropic isn't set up.
     if "anthropic" not in session.data:
-        session.data["anthropic"] = GeminiClient(
-            api_key=settings.gemini_api_key,
-            api_url=settings.gemini_api_url,
-            http=http,
-        )
+        if settings.anthropic_api_key:
+            session.data["anthropic"] = AnthropicClient(
+                api_key=settings.anthropic_api_key,
+                http=http,
+            )
+        else:
+            session.data["anthropic"] = GeminiClient(
+                api_key=settings.gemini_api_key,
+                api_url=settings.gemini_api_url,
+                http=http,
+            )
 
     if "image_downloader" not in session.data:
         session.data["image_downloader"] = ImageDownloader(http=http)
@@ -88,9 +96,9 @@ def _build_session_services(session) -> None:
         )
 
     if "anthropic_semaphore" not in session.data:
-        # Shared across all LLM calls, capped at 5 concurrent vision/text
+        # Shared across all LLM calls, capped at 8 concurrent vision/text
         # requests so we don't blow through Gemini's free-tier RPM.
-        session.data["anthropic_semaphore"] = asyncio.Semaphore(5)
+        session.data["anthropic_semaphore"] = asyncio.Semaphore(8)
         session.data["vision_semaphore"] = session.data["anthropic_semaphore"]
 
     session.data.setdefault("findings", [])

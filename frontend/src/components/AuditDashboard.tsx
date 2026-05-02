@@ -7,6 +7,7 @@ import RemediationDrawer from "./RemediationDrawer";
 import ExposureScore from "./ExposureScore";
 import GeoMap from "./GeoMap";
 import KnowledgeGraphPanel from "./KnowledgeGraphPanel";
+import EnrichmentPanel from "./EnrichmentPanel";
 
 interface Props {
   sessionId: string;
@@ -111,6 +112,13 @@ export default function AuditDashboard({ sessionId }: Props) {
               findings={audit.findingsByPipeline[p]}
             />
           ))}
+        </section>
+
+        <section className="mt-6">
+          <EnrichmentPanel
+            profile={audit.profile}
+            webFootprintStatus={audit.pipelineStatuses.web_footprint}
+          />
         </section>
 
         {(audit.totalFindings > 0 || audit.aggregator) && (

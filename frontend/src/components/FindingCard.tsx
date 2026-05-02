@@ -77,14 +77,6 @@ export default function FindingCard({ finding }: Props) {
           </div>
         </div>
 
-        <div className="border-l border-kali-text bg-kali-bg px-3 py-2">
-          <span className="mb-1 block font-mono text-[10px] uppercase tracking-label text-kali-label">
-            $ remediation
-          </span>
-          <p className="prose text-[14px] text-kali-text">
-            {finding.remediation}
-          </p>
-        </div>
       </div>
     </article>
   );
