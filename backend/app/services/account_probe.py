@@ -43,7 +43,11 @@ _ALWAYS_INCLUDE = {
     "dehashed",
 }
 
-_BODY_SCAN_BYTES = 2000
+# Sherlock/WMN error markers can sit deep in HTML for Discourse / Vue / SPA
+# pages whose 404 templates render after sizable nav/header markup
+# (Signal's community forum is the canonical example — "Oops!" lives at
+# byte ~11.5k). Scan the first 64 KB; substring search is cheap.
+_BODY_SCAN_BYTES = 65536
 _REQUEST_TIMEOUT = httpx.Timeout(8.0, connect=5.0)
 _DEFAULT_CONCURRENCY = 8
 
@@ -143,7 +147,15 @@ async def _check_one(
         except Exception:
             return None
 
-    body_for_match = body[:_BODY_SCAN_BYTES * 4]  # generous match window
+    body_for_match = body[:_BODY_SCAN_BYTES]
+
+    # Universal short-circuit: a 4xx/5xx is never an existing user, no
+    # matter what error_types the catalog declared. Catches the Signal /
+    # Discord.bio class of FPs where Sherlock listed errorType="message"
+    # only, the upstream HTML/error message has since changed, and the
+    # 404 was being interpreted as "found" because no status check ran.
+    if resp.status_code >= 400:
+        return None
 
     if have_two_sided:
         e_match = (resp.status_code == e_code) and (e_string in body_for_match)
@@ -159,12 +171,17 @@ async def _check_one(
             codes = error_codes or [404]
             if resp.status_code in codes:
                 return None
-            if resp.status_code >= 400 and resp.status_code not in (200, 201, 202):
-                return None
         if "message" in error_types and error_messages:
             snippet = body_for_match.lower()
             for needle in error_messages:
                 if needle and needle.lower() in snippet:
+                    return None
+            # Message-only Sherlock entry: require a positive signal to
+            # avoid concluding "user exists" purely from absence-of-error.
+            # A 200 response whose body never mentions the username is
+            # almost always a homepage redirect or generic landing page.
+            if "status_code" not in error_types:
+                if username.lower() not in body_for_match.lower():
                     return None
 
     risk = "HIGH" if _is_high_risk(name, category) else "MEDIUM"

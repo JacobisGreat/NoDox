@@ -1004,6 +1004,138 @@ async def _run_aggregation(
 # ---------------------------------------------------------------------------
 
 
+def _categorize_signals(
+    all_signals: list[dict],
+) -> tuple[list[dict], list[dict], dict[str, int]]:
+    """Partition signals into (image, tag) lists and tally per-channel
+    counts for the scan summary."""
+    image_signals: list[dict] = []
+    tag_signals: list[dict] = []
+    counts: dict[str, int] = {
+        "exif_gps": 0,
+        "geoclip": 0,
+        "vlm": 0,
+        "ocr_geocoded": 0,
+        "ocr_raw": 0,
+        "objects": 0,
+        "tag": 0,
+    }
+    for sig in all_signals:
+        category = sig.get("category", _CAT_IMAGE_SECONDARY)
+        sig_type = sig.get("type", "")
+        if category == _CAT_TAG:
+            tag_signals.append(sig)
+            counts["tag"] += 1
+        else:
+            image_signals.append(sig)
+        if sig_type == "exif_gps":
+            counts["exif_gps"] += 1
+        elif sig_type == "geoclip_prediction":
+            counts["geoclip"] += 1
+        elif sig_type.startswith("vlm") or sig_type in {
+            "vlm_signal",
+            "street_sign",
+            "landmark",
+        }:
+            counts["vlm"] += 1
+        elif sig_type == "media_analyzer_ocr":
+            counts["ocr_geocoded"] += 1
+        elif sig_type == "media_analyzer_ocr_raw":
+            counts["ocr_raw"] += 1
+        elif sig_type == "media_analyzer_object":
+            counts["objects"] += 1
+    return image_signals, tag_signals, counts
+
+
+async def _emit_scan_summary(
+    session: SessionState,
+    *,
+    images_scanned: int,
+    counts: dict[str, int],
+    has_image_signal: bool,
+    has_tag_signal: bool,
+) -> None:
+    """Always emit a finding summarizing what image-based scanning produced.
+    Critical for transparency: even when image scanners draw a blank, the
+    user sees that we ran them and that the displayed estimate is a tag
+    fallback."""
+    image_signal_total = (
+        counts.get("exif_gps", 0)
+        + counts.get("geoclip", 0)
+        + counts.get("vlm", 0)
+        + counts.get("ocr_geocoded", 0)
+        + counts.get("ocr_raw", 0)
+        + counts.get("objects", 0)
+    )
+
+    evidence_chain = [
+        f"Images scanned: {images_scanned}",
+        f"EXIF GPS hits: {counts.get('exif_gps', 0)}",
+        f"GeoCLIP image-to-coord predictions: {counts.get('geoclip', 0)}",
+        f"VLM landmark/visual signals: {counts.get('vlm', 0)}",
+        f"OCR geocoded matches: {counts.get('ocr_geocoded', 0)}",
+        f"OCR raw text snippets: {counts.get('ocr_raw', 0)}",
+        f"Detected locale-specific objects: {counts.get('objects', 0)}",
+        f"Instagram location tags collected: {counts.get('tag', 0)}",
+    ]
+
+    if has_image_signal:
+        risk = "LOW"
+        confidence = 0.55
+        remediation = (
+            "Image-based geolocation produced usable signal — review the "
+            "individual EXIF / GeoCLIP / VLM / OCR findings and the "
+            "estimated-location map for the cluster decision."
+        )
+        evidence_chain.append(
+            "Decision: image-based signals are driving the location estimate."
+        )
+    elif has_tag_signal:
+        risk = "MEDIUM"
+        confidence = 0.4
+        remediation = (
+            "Image-based scanners drew a blank on these posts. The location "
+            "estimate is a fallback derived from Instagram location tags "
+            "only — treat it as approximate, not confirmed."
+        )
+        evidence_chain.append(
+            "Decision: no image-based signal — falling back to Instagram "
+            "location tags as the only location estimate."
+        )
+    else:
+        risk = "LOW"
+        confidence = 0.2
+        remediation = (
+            "Neither image-based scanning nor Instagram tags produced any "
+            "usable location signal for this account."
+        )
+        evidence_chain.append(
+            "Decision: no location estimate possible from this post set."
+        )
+
+    finding = Finding(
+        source="geolocation_scan_summary",
+        evidence_chain=evidence_chain,
+        confidence=confidence,
+        risk_level=risk,  # type: ignore[arg-type]
+        remediation=remediation,
+        metadata={
+            "images_scanned": images_scanned,
+            "channel_counts": counts,
+            "image_signal_total": image_signal_total,
+            "primary_source": (
+                "image"
+                if has_image_signal
+                else ("tag_fallback" if has_tag_signal else "none")
+            ),
+            "signal_category": (
+                _CAT_IMAGE_PRIMARY if has_image_signal else _CAT_TAG
+            ),
+        },
+    )
+    await _emit_finding(session, finding)
+
+
 async def run(session: SessionState) -> None:
     await session.publish_event(_pipeline_status_event(_PIPELINE, "running"))
 
@@ -1014,6 +1146,7 @@ async def run(session: SessionState) -> None:
 
         cost_tracker = session.data.get("cost_tracker")
         all_signals: list[dict] = []
+        images_scanned = 0
         budget_exceeded = False
 
         for post in image_posts:
@@ -1024,6 +1157,7 @@ async def run(session: SessionState) -> None:
                 break
             try:
                 signals = await _process_post(session, post)
+                images_scanned += 1
             except Exception:
                 # One bad post should never abort the pipeline.
                 continue
@@ -1039,8 +1173,40 @@ async def run(session: SessionState) -> None:
             )
             return
 
-        if len(all_signals) >= _MIN_SIGNALS_FOR_AGGREGATION:
-            await _run_aggregation(session, all_signals)
+        # Partition by category and decide aggregation strategy.
+        image_signals, tag_signals, counts = _categorize_signals(all_signals)
+        has_image_signal = bool(image_signals)
+        has_tag_signal = bool(tag_signals)
+
+        # Always tell the user what was scanned, even on a complete miss.
+        await _emit_scan_summary(
+            session,
+            images_scanned=images_scanned,
+            counts=counts,
+            has_image_signal=has_image_signal,
+            has_tag_signal=has_tag_signal,
+        )
+
+        # Aggregation routing:
+        # 1. Image signals exist  → image-primary, tags corroborate
+        # 2. No image, only tags → tag-fallback estimate (low confidence)
+        # 3. Neither             → skip aggregation entirely
+        total_signal_count = len(image_signals) + len(tag_signals)
+        if has_image_signal and total_signal_count >= _MIN_SIGNALS_FOR_AGGREGATION:
+            await _run_aggregation(
+                session,
+                image_signals,
+                tag_signals,
+                primary_source="image",
+            )
+        elif has_tag_signal and not has_image_signal:
+            # Tag-only fallback: emit cluster guesses but flagged as low-confidence.
+            await _run_aggregation(
+                session,
+                [],
+                tag_signals,
+                primary_source="tag_fallback",
+            )
 
         await session.publish_event(_pipeline_status_event(_PIPELINE, "complete"))
     except Exception as exc:  # noqa: BLE001 — defensive top-level guard

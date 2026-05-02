@@ -14,12 +14,49 @@ interface Props {
   findings: Finding[];
 }
 
+type SignalCategory = "image_primary" | "image_secondary" | "tag";
+
 interface GeoPoint {
   lat: number;
   lon: number;
   confidence: number;
   source: string;
   label: string | null;
+  category: SignalCategory;
+}
+
+// Image-derived signals are the primary evidence channel — they drive
+// the centroid. Instagram tags are corroboration only: they contribute
+// at a fraction of the weight so they refine, not dominate.
+const TAG_CENTROID_WEIGHT = 0.25;
+const IMAGE_SECONDARY_WEIGHT = 0.7;
+const IMAGE_PRIMARY_WEIGHT = 1.0;
+
+function categoryWeight(c: SignalCategory): number {
+  if (c === "tag") return TAG_CENTROID_WEIGHT;
+  if (c === "image_secondary") return IMAGE_SECONDARY_WEIGHT;
+  return IMAGE_PRIMARY_WEIGHT;
+}
+
+const TAG_SOURCES = new Set([
+  "instagram_location_tag",
+]);
+const IMAGE_PRIMARY_SOURCES = new Set([
+  "exif_gps",
+  "geoclip_prediction",
+]);
+
+function classifySignal(
+  source: string,
+  metadataCategory: string | null,
+): SignalCategory {
+  if (metadataCategory === "image_primary") return "image_primary";
+  if (metadataCategory === "image_secondary") return "image_secondary";
+  if (metadataCategory === "tag") return "tag";
+  // Fallback for findings emitted before the categorization rollout.
+  if (TAG_SOURCES.has(source)) return "tag";
+  if (IMAGE_PRIMARY_SOURCES.has(source)) return "image_primary";
+  return "image_secondary";
 }
 
 // --------------------------------------------------------------------- //
@@ -104,7 +141,8 @@ interface Centroid {
 }
 
 const EARTH_RADIUS_KM = 6371;
-const MIN_RADIUS_KM = 25;
+const MIN_RADIUS_KM = 8;
+const MAX_RADIUS_KM = 80;
 
 // CartoDB Dark Matter — free, no API key, dark palette matches the theme.
 const TILE_URL =
@@ -142,6 +180,40 @@ interface RawSignal {
   label: string | null;
   confidence: number;
   source: string;
+  category: SignalCategory;
+}
+
+interface ScanSummary {
+  imagesScanned: number;
+  primarySource: "image" | "tag_fallback" | "none" | null;
+  imageSignalTotal: number;
+  channelCounts: Record<string, number>;
+}
+
+function readScanSummary(findings: Finding[]): ScanSummary | null {
+  for (let i = findings.length - 1; i >= 0; i--) {
+    const f = findings[i];
+    if (f.source !== "geolocation_scan_summary") continue;
+    const md = (f.metadata ?? {}) as Record<string, unknown>;
+    const counts =
+      (typeof md.channel_counts === "object" && md.channel_counts !== null
+        ? (md.channel_counts as Record<string, number>)
+        : {}) ?? {};
+    return {
+      imagesScanned:
+        typeof md.images_scanned === "number" ? md.images_scanned : 0,
+      primarySource:
+        md.primary_source === "image" ||
+        md.primary_source === "tag_fallback" ||
+        md.primary_source === "none"
+          ? md.primary_source
+          : null,
+      imageSignalTotal:
+        typeof md.image_signal_total === "number" ? md.image_signal_total : 0,
+      channelCounts: counts,
+    };
+  }
+  return null;
 }
 
 /**
@@ -153,6 +225,9 @@ interface RawSignal {
 function collectSignals(findings: Finding[]): RawSignal[] {
   const out: RawSignal[] = [];
   for (const f of findings) {
+    // Skip the scan-summary finding — it's a status row, not a map signal.
+    if (f.source === "geolocation_scan_summary") continue;
+
     const md = f.metadata as Record<string, unknown> | undefined;
     if (!md) continue;
 
@@ -171,6 +246,9 @@ function collectSignals(findings: Finding[]): RawSignal[] {
       null;
 
     const conf = Math.max(0, Math.min(1, f.confidence));
+    const metadataCategory =
+      typeof md.signal_category === "string" ? md.signal_category : null;
+    const category = classifySignal(f.source, metadataCategory);
 
     if (
       lat !== null &&
@@ -185,9 +263,16 @@ function collectSignals(findings: Finding[]): RawSignal[] {
         label,
         confidence: conf,
         source: f.source,
+        category,
       });
     } else if (label) {
-      out.push({ coords: null, label, confidence: conf, source: f.source });
+      out.push({
+        coords: null,
+        label,
+        confidence: conf,
+        source: f.source,
+        category,
+      });
     }
   }
   return out;
@@ -195,34 +280,51 @@ function collectSignals(findings: Finding[]): RawSignal[] {
 
 function computeCentroid(points: GeoPoint[]): Centroid | null {
   if (points.length === 0) return null;
+
+  // Image-derived signals are the authoritative evidence — base the
+  // centroid on them when any exist. Tags only contribute when image
+  // signal is missing entirely (tag-fallback estimation), and even then
+  // each tag carries a smaller weight so a single rogue tag doesn't
+  // dominate the radius.
+  const imagePoints = points.filter((p) => p.category !== "tag");
+  const usePoints = imagePoints.length > 0 ? imagePoints : points;
+  const tagFallback = imagePoints.length === 0;
+
   let totalW = 0;
   let lat = 0;
   let lon = 0;
-  for (const p of points) {
-    const w = p.confidence + 0.1;
+  for (const p of usePoints) {
+    const w = (p.confidence + 0.1) * categoryWeight(p.category);
     totalW += w;
     lat += p.lat * w;
     lon += p.lon * w;
   }
+  if (totalW === 0) return null;
   lat /= totalW;
   lon /= totalW;
 
   let maxDist = 0;
   let weightedConf = 0;
-  for (const p of points) {
+  for (const p of usePoints) {
     const d = haversineKm(p, { lat, lon });
     if (d > maxDist) maxDist = d;
-    weightedConf += p.confidence * (p.confidence + 0.1);
+    const w = (p.confidence + 0.1) * categoryWeight(p.category);
+    weightedConf += p.confidence * w;
   }
   weightedConf /= totalW;
 
-  const radiusKm =
-    points.length === 1
-      ? Math.max(MIN_RADIUS_KM, (1 - weightedConf) * 1500)
-      : Math.max(MIN_RADIUS_KM, maxDist);
+  // A tag-only fallback is intentionally less certain — widen the ring,
+  // but everything stays clamped under MAX_RADIUS_KM so the circle never
+  // dwarfs the city it's centered on.
+  const fallbackInflation = tagFallback ? 1.6 : 1.0;
+  const rawRadius =
+    usePoints.length === 1
+      ? (1 - weightedConf) * 60 * fallbackInflation
+      : maxDist * fallbackInflation;
+  const radiusKm = Math.max(MIN_RADIUS_KM, Math.min(MAX_RADIUS_KM, rawRadius));
 
   const labelCounts = new Map<string, number>();
-  for (const p of points) {
+  for (const p of usePoints) {
     if (p.label) labelCounts.set(p.label, (labelCounts.get(p.label) ?? 0) + 1);
   }
   let bestLabel: string | null = null;
@@ -251,7 +353,17 @@ function HyperzoomController({ centroid }: { centroid: Centroid }) {
   const map = useMap();
 
   useEffect(() => {
-    const target: L.LatLngExpression = [centroid.lat, centroid.lon];
+    // Build a bounding box around the confidence ring so the final zoom
+    // frames the entire circle. 1° latitude ≈ 111 km; longitude shrinks
+    // by cos(lat) toward the poles.
+    const latRad = (centroid.lat * Math.PI) / 180;
+    const cosLat = Math.max(0.1, Math.cos(latRad));
+    const latSpan = centroid.radiusKm / 111;
+    const lonSpan = centroid.radiusKm / (111 * cosLat);
+    const bounds = L.latLngBounds(
+      [centroid.lat - latSpan, centroid.lon - lonSpan],
+      [centroid.lat + latSpan, centroid.lon + lonSpan],
+    );
 
     // Always snap to a global vantage so the cinematic arc reads from
     // the start, even on re-mount or when the centroid hasn't moved.
@@ -262,7 +374,11 @@ function HyperzoomController({ centroid }: { centroid: Centroid }) {
     // single rAF is enough for layout to settle without the 80ms wait.
     const raf = window.requestAnimationFrame(() => {
       map.invalidateSize({ animate: false, pan: false });
-      map.flyTo(target, ZOOM_TARGET, {
+      // flyToBounds frames the whole confidence ring with breathing
+      // room. Padded so the dashed circle isn't pressed to the edge.
+      map.flyToBounds(bounds, {
+        padding: [40, 40],
+        maxZoom: ZOOM_TARGET,
         duration: ZOOM_DURATION_S,
         easeLinearity: ZOOM_EASE,
         noMoveStart: true,
@@ -327,10 +443,21 @@ export default function GeoMap({ findings }: Props) {
         confidence: s.confidence,
         source: s.source,
         label: s.label,
+        category: s.category,
       });
     }
     return out;
   }, [signals, resolvedLabels]);
+
+  const scanSummary = useMemo(() => readScanSummary(findings), [findings]);
+  const imagePointCount = useMemo(
+    () => points.filter((p) => p.category !== "tag").length,
+    [points],
+  );
+  const tagPointCount = points.length - imagePointCount;
+  const isTagFallback =
+    (scanSummary?.primarySource === "tag_fallback") ||
+    (imagePointCount === 0 && tagPointCount > 0);
 
   const centroid = useMemo(() => computeCentroid(points), [points]);
   const [zoomingDone, setZoomingDone] = useState(false);
@@ -364,6 +491,13 @@ export default function GeoMap({ findings }: Props) {
             {points.length}
           </span>
         </header>
+        {scanSummary && (
+          <div className="mb-3 rounded-md border border-nodoxx-border/40 bg-nodoxx-bg/60 px-3 py-2 font-mono text-[11px] leading-relaxed text-nodoxx-muted">
+            Scanned {scanSummary.imagesScanned} image
+            {scanSummary.imagesScanned === 1 ? "" : "s"} via EXIF · GeoCLIP ·
+            VLM · OCR · object detection — no usable location signal yet.
+          </div>
+        )}
         <div className="flex h-40 items-center justify-center rounded-lg border border-dashed border-nodoxx-border/40 text-xs text-nodoxx-muted">
           {pendingGeocodes > 0
             ? `Geocoding ${pendingGeocodes} location ${
@@ -407,6 +541,41 @@ export default function GeoMap({ findings }: Props) {
           Best match:{" "}
           <span className="text-nodoxx-text">{centroid.bestLabel}</span>
         </p>
+      )}
+
+      {scanSummary && (
+        <div
+          className={`mb-3 rounded-md border px-3 py-2 font-mono text-[11px] leading-relaxed ${
+            isTagFallback
+              ? "border-risk-medium/40 bg-risk-medium/10 text-risk-medium"
+              : "border-nodoxx-border/40 bg-nodoxx-bg/60 text-nodoxx-muted"
+          }`}
+        >
+          <div className="text-nodoxx-text/90">
+            Scanned {scanSummary.imagesScanned} image
+            {scanSummary.imagesScanned === 1 ? "" : "s"} via EXIF · GeoCLIP ·
+            VLM · OCR · object detection
+            {" — "}
+            <span className="font-semibold">
+              {scanSummary.imageSignalTotal}
+            </span>{" "}
+            image-derived signal
+            {scanSummary.imageSignalTotal === 1 ? "" : "s"}
+          </div>
+          {isTagFallback && (
+            <div className="mt-1">
+              No usable image-based location signal — falling back to Instagram
+              location tags as the only estimate. Treat the marker as
+              approximate.
+            </div>
+          )}
+          {!isTagFallback && tagPointCount > 0 && (
+            <div className="mt-1 text-nodoxx-muted/80">
+              + {tagPointCount} Instagram tag{tagPointCount === 1 ? "" : "s"}{" "}
+              corroborating the image-based estimate.
+            </div>
+          )}
+        </div>
       )}
 
       <div className="relative overflow-hidden rounded-lg border border-nodoxx-border/30 bg-nodoxx-bg">
@@ -455,21 +624,38 @@ export default function GeoMap({ findings }: Props) {
             />
           )}
 
-          {/* Per-evidence markers. Drawn translucent during flight so
-              the eye stays on the centroid. */}
-          {points.map((p, i) => (
-            <CircleMarker
-              key={`p-${i}`}
-              center={[p.lat, p.lon]}
-              radius={3 + p.confidence * 4}
-              pathOptions={{
-                color: "#0a0f1e",
-                weight: 1,
-                fillColor: "#00d4ff",
-                fillOpacity: zoomingDone ? 0.95 : 0.4,
-              }}
-            />
-          ))}
+          {/* Per-evidence markers. Image-derived points: solid cyan dot
+              (the authoritative evidence). Tag-derived points: hollow
+              cyan ring (visually subordinate, since tags only corroborate
+              image-based inference). Drawn translucent during the flyTo
+              so the eye stays on the centroid. */}
+          {points.map((p, i) => {
+            const isTag = p.category === "tag";
+            return (
+              <CircleMarker
+                key={`p-${i}`}
+                center={[p.lat, p.lon]}
+                radius={isTag ? 5 + p.confidence * 2 : 3 + p.confidence * 4}
+                pathOptions={
+                  isTag
+                    ? {
+                        color: "#00d4ff",
+                        weight: 1.4,
+                        opacity: zoomingDone ? 0.85 : 0.35,
+                        fillColor: "#00d4ff",
+                        fillOpacity: zoomingDone ? 0.12 : 0.05,
+                        dashArray: "2 2",
+                      }
+                    : {
+                        color: "#0a0f1e",
+                        weight: 1,
+                        fillColor: "#00d4ff",
+                        fillOpacity: zoomingDone ? 0.95 : 0.4,
+                      }
+                }
+              />
+            );
+          })}
         </MapContainer>
 
         <div className="pointer-events-none absolute bottom-2 left-2 z-[400] rounded bg-nodoxx-bg/80 px-2 py-1 font-mono text-[10px] uppercase tracking-wider text-nodoxx-muted backdrop-blur">
@@ -478,23 +664,47 @@ export default function GeoMap({ findings }: Props) {
       </div>
 
       <ul className="mt-4 grid grid-cols-1 gap-2 sm:grid-cols-2">
-        {points.slice(0, 6).map((p, i) => (
-          <li
-            key={`leg-${i}`}
-            className="flex items-center justify-between gap-3 rounded-md border border-nodoxx-border/30 bg-nodoxx-bg/60 px-3 py-2 text-xs"
-          >
-            <span className="flex items-center gap-2 truncate text-nodoxx-text/90">
-              <span
-                aria-hidden="true"
-                className="inline-block h-2 w-2 shrink-0 rounded-full bg-nodoxx-accent"
-              />
-              <span className="truncate font-mono">{p.source}</span>
-            </span>
-            <span className="shrink-0 font-mono text-nodoxx-muted">
-              {p.label ?? `${p.lat.toFixed(2)}, ${p.lon.toFixed(2)}`}
-            </span>
-          </li>
-        ))}
+        {points
+          .slice()
+          .sort((a, b) => {
+            // Image-derived first, then tags. Within each group: higher
+            // confidence wins.
+            const order = (p: GeoPoint) =>
+              p.category === "tag" ? 1 : 0;
+            const dg = order(a) - order(b);
+            if (dg !== 0) return dg;
+            return b.confidence - a.confidence;
+          })
+          .slice(0, 6)
+          .map((p, i) => {
+            const isTag = p.category === "tag";
+            return (
+              <li
+                key={`leg-${i}`}
+                className="flex items-center justify-between gap-3 rounded-md border border-nodoxx-border/30 bg-nodoxx-bg/60 px-3 py-2 text-xs"
+              >
+                <span className="flex items-center gap-2 truncate text-nodoxx-text/90">
+                  <span
+                    aria-hidden="true"
+                    className={`inline-block h-2 w-2 shrink-0 rounded-full ${
+                      isTag
+                        ? "border border-nodoxx-accent bg-transparent"
+                        : "bg-nodoxx-accent"
+                    }`}
+                  />
+                  <span className="truncate font-mono">{p.source}</span>
+                  {isTag && (
+                    <span className="shrink-0 rounded bg-nodoxx-bg px-1 font-mono text-[9px] uppercase tracking-wider text-nodoxx-muted">
+                      tag
+                    </span>
+                  )}
+                </span>
+                <span className="shrink-0 font-mono text-nodoxx-muted">
+                  {p.label ?? `${p.lat.toFixed(2)}, ${p.lon.toFixed(2)}`}
+                </span>
+              </li>
+            );
+          })}
       </ul>
     </section>
   );
