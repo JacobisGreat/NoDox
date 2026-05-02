@@ -477,9 +477,10 @@ async def test_waf_response_returns_no_finding(sema):
     assert result is None  # WAF-blocked → inconclusive, don't emit
 
 
-async def test_non_matching_display_name_haircuts_confidence(sema):
+async def test_generic_landing_page_dropped_by_floor(sema):
     """A site that returns a generic landing page ('TikTok - Make Your Day')
-    should NOT pop to MEDIUM just because we extracted a title."""
+    triggers the name-mismatch haircut and falls below the 0.25 confidence
+    floor → no finding emitted."""
     platform = {
         "name": "TikTok",
         "url_template": "https://example.com/@{username}",
@@ -510,11 +511,86 @@ async def test_non_matching_display_name_haircuts_confidence(sema):
             sentence_model=None,
             semaphore=sema,
         )
-    # TikTok IS in the high-risk set → risk bumped, but confidence stays low.
+    assert result is None
+
+
+async def test_username_in_title_promotes_to_high_confidence(sema):
+    """When the page title contains the username (e.g. 'caitwdc - Twitch'),
+    it's a real user page — confidence must clear LOW."""
+    platform = {
+        "name": "Twitch",
+        "url_template": "https://example.com/{username}",
+        "probe_template": "https://example.com/{username}",
+        "method": "GET",
+        "headers": {},
+        "error_types": ["status_code"],
+        "error_messages": [],
+        "error_codes": [],
+        "error_url_template": "",
+        "regex_check": None,
+        "category": "social_media",
+    }
+
+    def handler(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            text="<html><head><title>caitwdc - Twitch</title></head></html>",
+        )
+
+    async with _mock_http(handler) as http:
+        result = await _check_platform(
+            platform,
+            username="caitwdc",
+            full_name="Caitlyn Walker",
+            ig_bio="",
+            ig_phash=None,
+            http=http,
+            image_downloader=None,
+            sentence_model=None,
+            semaphore=sema,
+        )
     assert result is not None
-    assert result.confidence < 0.30  # 0.30 baseline * 0.7 haircut
-    # The risk-bump rule requires confidence >= 0.50 for HIGH; we're under.
-    assert result.risk_level == "LOW"
+    # username_in_title doubles the bare-URL signal → 0.50 confidence.
+    assert result.confidence >= 0.50
+
+
+async def test_user_not_found_in_title_vetoes_finding(sema):
+    """Sherlock might say CLAIMED (status_code 200) for an SPA shell, but
+    the rendered title literally says 'User not found'. We override and
+    drop the finding."""
+    platform = {
+        "name": "Hashnode",
+        "url_template": "https://example.com/@{username}",
+        "probe_template": "https://example.com/@{username}",
+        "method": "GET",
+        "headers": {},
+        "error_types": ["status_code"],
+        "error_messages": [],
+        "error_codes": [],
+        "error_url_template": "",
+        "regex_check": None,
+        "category": "development",
+    }
+
+    def handler(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            text="<html><head><title>User not found | Hashnode</title></head></html>",
+        )
+
+    async with _mock_http(handler) as http:
+        result = await _check_platform(
+            platform,
+            username="ghost",
+            full_name="",
+            ig_bio="",
+            ig_phash=None,
+            http=http,
+            image_downloader=None,
+            sentence_model=None,
+            semaphore=sema,
+        )
+    assert result is None
 
 
 # --------------------------- loader integration ------------------------------- #

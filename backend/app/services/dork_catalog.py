@@ -1,8 +1,8 @@
 """Google-dork pattern catalog.
 
 Translated from systems/DorkER/dorker.py (MIT). The runner is *not*
-ported — we already have ``services/google_cse.py`` for paid-tier Google
-search. Only the patterns are useful.
+ported — we already have ``services/serper.py`` for web search. Only
+the patterns are useful.
 
 These functions return flat ``list[str]`` ready to drop into
 ``web_footprint`` alongside the hand-written base queries.

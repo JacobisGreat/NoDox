@@ -16,3 +16,7 @@ frontend/vite.config.js
 
 # Vendored third-party OSINT tools used as data/inspiration only
 systems/
+
+# Local scratch
+tmp/
+Screenshot*.png

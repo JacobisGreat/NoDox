@@ -79,6 +79,51 @@ _WAF_FINGERPRINTS: tuple[str, ...] = (
     '<span id="challenge-error-text">',
     "AwsWafIntegration.forceRefreshToken",
     "perimeterxIdentifiers",
+    # Extras observed in the wild that produce 200/OK pages we should
+    # treat as inconclusive rather than as a confirmed account hit.
+    "Attention Required! | Cloudflare",
+    "Please wait for verification",
+    "Security Verification",
+    "Making sure you&#39;re not a bot",
+    "Making sure you're not a bot",
+    "Checking your browser",
+    "ERROR: The request could not be satisfied",
+    "Client Challenge",
+    "Just a moment&hellip;",
+    "Just a moment...",
+    "cf-browser-verification",
+    "captcha-bypass",
+)
+
+# Page-level error/landing fingerprints. A site can return 200 (so
+# Sherlock's status_code detector says "claimed") while the page is
+# actually a "user not found" view — common for Next.js / Nuxt SPAs and
+# CDN error overlays. If the title/first 1KB matches any of these we
+# DROP the finding, overriding Sherlock's verdict.
+_NEGATIVE_TITLE_PATTERNS: tuple[str, ...] = (
+    "user not found",
+    "profile not found",
+    "page not found",
+    "page no longer exists",
+    "404 - page not found",
+    "404 not found",
+    "404: ",
+    "página não existe",  # mercadolivre
+    "this page doesn't exist",
+    "this page does not exist",
+    "не существует",  # ru "doesn't exist"
+    "не найдена",  # ru "not found"
+    "ошибка",  # ru "error"
+    "page is unavailable",
+    "border patrol",  # NationStates negative landing
+    "log in to see",
+    "sign up to see",
+    "redirecting...",
+)
+_NEGATIVE_BODY_PATTERNS: tuple[str, ...] = (
+    "user not found",
+    "profile not found",
+    "page no longer exists",
 )
 
 _TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
@@ -279,6 +324,23 @@ def _looks_like_waf(body: str) -> bool:
     return any(sig in body for sig in _WAF_FINGERPRINTS)
 
 
+def _looks_like_not_found(title: str, body_head: str) -> bool:
+    """Override Sherlock's CLAIMED verdict when the page itself says the
+    user/page doesn't exist. Catches SPA shells and CDN error overlays
+    that Sherlock can't detect upstream."""
+    if title:
+        t = title.lower()
+        for pattern in _NEGATIVE_TITLE_PATTERNS:
+            if pattern in t:
+                return True
+    if body_head:
+        b = body_head.lower()
+        for pattern in _NEGATIVE_BODY_PATTERNS:
+            if pattern in b:
+                return True
+    return False
+
+
 def _substitute_payload(value: Any, username: str) -> Any:
     """Recursively substitute Sherlock's ``{}`` placeholder in a request
     payload (Anilist's GraphQL query, Discord's username probe, etc.)."""
@@ -419,10 +481,24 @@ async def _check_platform(
     display_name = _extract_display_name(snippet) or ""
     bio_text = _extract_bio(snippet) or ""
 
+    # Veto: page itself says "user not found" / "page not found" /
+    # captcha / etc. — drop the finding even if Sherlock said CLAIMED.
+    if _looks_like_not_found(display_name, snippet):
+        return None
+
     name_similarity = (
         _token_sort_ratio(full_name, display_name)
         if full_name and display_name
         else 0.0
+    )
+
+    # Username in the page title is a strong positive signal even when
+    # the rendered display_name is the bare site name (e.g. "caitwdc -
+    # Twitch", "caitwdc | InternetArchive"). Sherlock's status_code can
+    # match generic landing pages that DON'T contain the username — this
+    # promotes the real user pages ahead of those.
+    username_in_title = bool(
+        username and display_name and username.lower() in display_name.lower()
     )
 
     photo_similarity: float | None = None
@@ -455,6 +531,10 @@ async def _check_platform(
     # Weighted-mean confidence. Bare URL hit (Sherlock-confirmed) is
     # 0.30; a strong corroborating signal can push it higher.
     weights: list[tuple[float, float]] = [(0.30, 1.0)]
+    if username_in_title:
+        # Direct corroboration — the username appears on the rendered
+        # page title — typical of true user-profile pages.
+        weights.append((0.30, 1.0))
     if display_name and name_similarity >= 0.4:
         weights.append((0.35, max(0.0, min(1.0, name_similarity))))
     if photo_similarity is not None:
@@ -469,13 +549,26 @@ async def _check_platform(
         score_sum = sum(w * s for w, s in weights)
         confidence = score_sum / weight_sum if weight_sum else 0.0
 
-    # Penalty: page rendered a clearly non-matching display name. This
-    # is what a generic site landing page looks like ("TikTok - Make
-    # Your Day"). 30% confidence haircut.
-    if display_name and full_name and name_similarity < 0.15:
+    # Penalty: page rendered a clearly non-matching display name without
+    # the username being anywhere in the title. This is what a generic
+    # site landing page looks like ("TikTok - Make Your Day"). 30% haircut.
+    if (
+        display_name
+        and full_name
+        and name_similarity < 0.15
+        and not username_in_title
+    ):
         confidence *= 0.7
 
     confidence = round(max(0.0, min(1.0, confidence)), 3)
+
+    # Floor: anything that only made it through with the haircut applied
+    # is almost certainly an SPA shell / generic landing page that
+    # Sherlock's status_code or message detector can't tell apart from
+    # a real user. Bare URL hits (0.30) and any corroborated hit stay.
+    if confidence < 0.25:
+        return None
+
     risk = _risk_for(confidence, name)
 
     evidence: list[str] = [

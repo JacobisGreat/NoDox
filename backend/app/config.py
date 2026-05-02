@@ -61,9 +61,9 @@ class Settings:
     anthropic_sonnet_model: str
     anthropic_haiku_model: str
 
-    # Google CSE (used by instance 2's web_footprint pipeline)
-    google_cse_api_key: str
-    google_cse_cx: str
+    # Serper.dev (web_footprint search backend; replaced Google CSE
+    # after Google closed Custom Search JSON API to new accounts in 2026)
+    serper_api_key: str
 
     # Per-audit budgets
     audit_cost_ceiling_usd: float
@@ -101,8 +101,7 @@ def get_settings() -> Settings:
         anthropic_haiku_model=_env_str(
             "ANTHROPIC_HAIKU_MODEL", "claude-haiku-4-5-20251001"
         ),
-        google_cse_api_key=_env_str("GOOGLE_CSE_API_KEY"),
-        google_cse_cx=_env_str("GOOGLE_CSE_CX"),
+        serper_api_key=_env_str("SERPER_API_KEY"),
         audit_cost_ceiling_usd=_env_float("AUDIT_COST_CEILING_USD", 1.0),
         web_footprint_budget_share_usd=_env_float(
             "WEB_FOOTPRINT_BUDGET_SHARE_USD", 0.35

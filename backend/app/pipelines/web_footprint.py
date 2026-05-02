@@ -27,7 +27,7 @@ from app.services import account_probe as _account_probe
 from app.services import breach_check as _breach_check
 from app.services import dork_catalog as _dork_catalog
 from app.services import intelbase as _intelbase
-from app.services.google_cse import GoogleCSEClient, GoogleCSEError
+from app.services.serper import SerperClient, SerperError
 from app.services.trafilatura_fetch import TrafilaturaFetcher
 from app.session_store import SessionState
 
@@ -500,6 +500,138 @@ async def _run_breach_check(
             await session.publish_event(_finding_event(_PIPELINE, payload))
 
 
+async def _run_intelbase_lookup(
+    session: SessionState, http, seen_emails: set[str]
+) -> None:
+    settings = get_settings()
+    if not seen_emails:
+        return
+    if not settings.intelbase_api_key:
+        await session.publish_event(
+            _pipeline_status_event(
+                _PIPELINE,
+                "running",
+                "INTELBASE_API_KEY not configured; IntelBase lookup skipped.",
+            )
+        )
+        return
+
+    findings_log: list[dict] = session.data.setdefault("findings", [])
+
+    async def _emit(finding: Finding) -> None:
+        payload = finding.to_dict()
+        tagged = dict(payload)
+        tagged["_pipeline"] = _PIPELINE
+        findings_log.append(tagged)
+        await session.publish_event(_finding_event(_PIPELINE, payload))
+
+    for email in sorted(seen_emails):
+        try:
+            result = await _intelbase.lookup_email(
+                email, settings.intelbase_api_key, http
+            )
+        except Exception:
+            continue
+        if result.is_empty:
+            continue
+
+        for breach in result.breaches:
+            risk = "CRITICAL" if breach.critical else "HIGH"
+            data_class_str = ", ".join(breach.data_classes) or "unknown"
+            evidence_chain = [
+                f"Email: {email}",
+                f"Breach: {breach.title or breach.name or 'unknown source'}",
+            ]
+            if breach.breach_date:
+                evidence_chain.append(f"Date: {breach.breach_date}")
+            if data_class_str != "unknown":
+                evidence_chain.append(f"Data classes: {data_class_str}")
+            if breach.domain:
+                evidence_chain.append(f"Domain: {breach.domain}")
+            evidence_chain.append("Source: IntelBase /lookup/email")
+
+            await _emit(
+                Finding(
+                    source="intelbase_breach",
+                    evidence_chain=evidence_chain,
+                    confidence=0.85,
+                    risk_level=risk,  # type: ignore[arg-type]
+                    remediation=(
+                        f"Rotate the password used at "
+                        f"{breach.domain or breach.name or 'this service'} and any "
+                        "service that reuses it. Enable 2FA. Check "
+                        "intelbase.is for the full breach record."
+                    ),
+                    metadata={
+                        "email": email,
+                        "breach_name": breach.name,
+                        "breach_title": breach.title,
+                        "breach_date": breach.breach_date,
+                        "domain": breach.domain,
+                        "data_classes": list(breach.data_classes),
+                        "description": breach.description,
+                    },
+                )
+            )
+
+        # Linked-account hits are useful identity signals but lower-risk than
+        # breaches. Bundle them into one finding per email so we don't drown
+        # the dashboard if IntelBase returns dozens.
+        if result.accounts:
+            sites = sorted(
+                {
+                    a.site or _domain_of(a.url)
+                    for a in result.accounts
+                    if a.site or a.url
+                }
+            )
+            evidence_chain = [
+                f"Email: {email}",
+                f"Linked accounts found on {len(sites)} site(s)",
+            ]
+            evidence_chain.extend(f"Account: {site}" for site in sites[:8])
+            if len(sites) > 8:
+                evidence_chain.append(f"... and {len(sites) - 8} more")
+            evidence_chain.append("Source: IntelBase /lookup/email")
+
+            await _emit(
+                Finding(
+                    source="intelbase_accounts",
+                    evidence_chain=evidence_chain,
+                    confidence=0.7,
+                    risk_level="MEDIUM",
+                    remediation=(
+                        f"IntelBase identified accounts registered to {email}. "
+                        "Audit each linked service, delete the ones you no "
+                        "longer use, and consider an alias email going forward."
+                    ),
+                    metadata={
+                        "email": email,
+                        "site_count": len(sites),
+                        "sites": sites,
+                        "accounts": [
+                            {
+                                "site": a.site,
+                                "url": a.url,
+                                "username": a.username,
+                            }
+                            for a in result.accounts
+                        ],
+                    },
+                )
+            )
+
+
+def _domain_of(url: str) -> str:
+    if not url:
+        return ""
+    try:
+        host = urlparse(url).netloc
+    except ValueError:
+        return ""
+    return host[4:] if host.startswith("www.") else host
+
+
 # ---------------------------------------------------------------------------
 # Entry point.
 # ---------------------------------------------------------------------------
@@ -522,12 +654,12 @@ async def run(session: SessionState) -> None:
             )
             return
 
-        if not settings.google_cse_api_key or not settings.google_cse_cx:
+        if not settings.serper_api_key:
             await session.publish_event(
                 _pipeline_status_event(
                     _PIPELINE,
                     "error",
-                    "Google CSE credentials not configured (GOOGLE_CSE_API_KEY / GOOGLE_CSE_CX).",
+                    "Serper credentials not configured (SERPER_API_KEY).",
                 )
             )
             return
@@ -575,9 +707,8 @@ async def run(session: SessionState) -> None:
             )
             return
 
-        cse = GoogleCSEClient(
-            api_key=settings.google_cse_api_key,
-            cx=settings.google_cse_cx,
+        cse = SerperClient(
+            api_key=settings.serper_api_key,
             http=http,
         )
         fetcher = TrafilaturaFetcher(http=http)
@@ -602,14 +733,14 @@ async def run(session: SessionState) -> None:
 
             try:
                 results = await cse.search(query, num=10)
-            except GoogleCSEError as exc:
-                # Surface non-fatal CSE issues but keep going to next query.
-                if exc.status_code in (429, 403):
+            except SerperError as exc:
+                # Surface non-fatal Serper issues but keep going to next query.
+                if exc.status_code in (429, 401, 403):
                     await session.publish_event(
                         _pipeline_status_event(
                             _PIPELINE,
                             "error",
-                            f"Google CSE refused requests ({exc.status_code}); halting.",
+                            f"Serper refused requests ({exc.status_code}); halting.",
                         )
                     )
                     return
@@ -704,6 +835,7 @@ async def run(session: SessionState) -> None:
         # ---- Post-dork pass: account probe + breach check ----------------
         await _run_account_probe(session, username, http)
         await _run_breach_check(session, http, seen_emails)
+        await _run_intelbase_lookup(session, http, seen_emails)
 
         await session.publish_event(_pipeline_status_event(_PIPELINE, "complete"))
     except Exception as exc:  # noqa: BLE001 — defensive top-level guard
