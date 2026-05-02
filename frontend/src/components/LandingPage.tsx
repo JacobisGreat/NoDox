@@ -28,6 +28,8 @@ export default function LandingPage() {
           );
         } else if (err.kind === "rate_limited") {
           setError("Instagram rate limit hit. Try again in a minute.");
+        } else if (err.kind === "validation") {
+          setError(err.message || "Invalid username.");
         } else {
           setError("Something went wrong. Try again.");
         }

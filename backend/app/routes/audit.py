@@ -29,6 +29,7 @@ from app.session_store import get_session
 # but we always import them so the orchestrator stays uniform.
 from app.pipelines import identity as identity_pipeline
 from app.pipelines import geolocation as geolocation_pipeline
+from app.pipelines import media as media_pipeline
 from app.pipelines import web_footprint as web_footprint_pipeline
 
 router = APIRouter(prefix="/audit", tags=["audit"])
@@ -37,6 +38,7 @@ router = APIRouter(prefix="/audit", tags=["audit"])
 PIPELINES: dict[str, Any] = {
     "identity": identity_pipeline.run,
     "geolocation": geolocation_pipeline.run,
+    "media": media_pipeline.run,
     "web_footprint": web_footprint_pipeline.run,
 }
 

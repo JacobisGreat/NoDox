@@ -12,6 +12,15 @@ async function readDetail(response: Response): Promise<string> {
     if (data && typeof data === "object" && "detail" in data) {
       const detail = (data as { detail?: unknown }).detail;
       if (typeof detail === "string") return detail;
+      // FastAPI/pydantic validation errors return detail as an array of
+      // {loc, msg, type, ...}. Surface the first useful message.
+      if (Array.isArray(detail) && detail.length > 0) {
+        const first = detail[0];
+        if (first && typeof first === "object" && "msg" in first) {
+          const msg = (first as { msg?: unknown }).msg;
+          if (typeof msg === "string") return msg;
+        }
+      }
     }
   } catch {
     // fall through
@@ -41,7 +50,8 @@ export async function fetchProfile(username: string): Promise<FetchProfileRespon
 
   let kind: FetchProfileErrorKind = "generic";
   if (response.status === 404) kind = "not_found";
-  else if (response.status === 422) kind = "private";
+  else if (response.status === 403) kind = "private";
+  else if (response.status === 422) kind = "validation";
   else if (response.status === 429) kind = "rate_limited";
 
   const detail = await readDetail(response);

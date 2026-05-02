@@ -49,7 +49,7 @@ async def fetch_profile(payload: FetchRequest) -> FetchResponse:
         )
     except InstaProfilePrivate:
         raise HTTPException(
-            status_code=422, detail="Cannot audit private profiles"
+            status_code=403, detail="Cannot audit private profiles"
         )
     except InstaRateLimited:
         raise HTTPException(
@@ -66,7 +66,7 @@ async def fetch_profile(payload: FetchRequest) -> FetchResponse:
 
     if result.profile.is_private:
         raise HTTPException(
-            status_code=422, detail="Cannot audit private profiles"
+            status_code=403, detail="Cannot audit private profiles"
         )
 
     session = create_session()

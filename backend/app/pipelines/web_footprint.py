@@ -23,6 +23,10 @@ from app.schemas.events import (
     pipeline_status as _pipeline_status_event,
 )
 from app.schemas.findings import Finding
+from app.services import account_probe as _account_probe
+from app.services import breach_check as _breach_check
+from app.services import dork_catalog as _dork_catalog
+from app.services import intelbase as _intelbase
 from app.services.google_cse import GoogleCSEClient, GoogleCSEError
 from app.services.trafilatura_fetch import TrafilaturaFetcher
 from app.session_store import SessionState
@@ -87,7 +91,14 @@ def _base_queries(username: str, full_name: str) -> list[str]:
         if username:
             queries.append(f"\"{full_name}\" \"{username}\"")
         queries.append(f"site:*.edu \"{full_name}\"")
+    # DorkER-derived patterns. De-duplicated via the set in run().
+    queries.extend(_dork_catalog.dorks_for_username(username))
+    queries.extend(_dork_catalog.dorks_for_full_name(full_name))
     return queries
+
+
+def _is_email_value(pii_type: str) -> bool:
+    return "email" in (pii_type or "").lower()
 
 
 async def _generate_custom_queries(
@@ -369,6 +380,127 @@ def _remediation_for(url: str, finding_type: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Account probe + breach check (post-dork passes).
+# ---------------------------------------------------------------------------
+
+
+def _account_probe_remediation(site: str, url: str, category: str) -> str:
+    if category == "professional":
+        return (
+            f"Lock down or remove the {site} profile at {url}. If the account "
+            "isn't yours, report it for impersonation."
+        )
+    if category == "development":
+        return (
+            f"Audit your {site} profile at {url} for repos, gists, or commit "
+            "history that expose personal data, and tighten visibility on what "
+            "you can't delete."
+        )
+    return (
+        f"Review the {site} account at {url} — set it private or delete it if "
+        "it's still active."
+    )
+
+
+async def _run_account_probe(session: SessionState, username: str, http) -> None:
+    settings = get_settings()
+    if not settings.account_probe_enabled or not username:
+        return
+    try:
+        hits = await _account_probe.probe(
+            username,
+            http,
+            concurrency=settings.account_probe_max_concurrent,
+        )
+    except Exception:
+        return
+
+    findings_log: list[dict] = session.data.setdefault("findings", [])
+    for hit in hits:
+        finding = Finding(
+            source="account_probe",
+            evidence_chain=[
+                f"Username probe: '{username}' resolves to a live page",
+                f"Site: {hit.site} ({hit.category})",
+                f"URL: {hit.url}",
+            ],
+            confidence=0.65,
+            risk_level=hit.risk_level,  # type: ignore[arg-type]
+            remediation=_account_probe_remediation(hit.site, hit.url, hit.category),
+            metadata={
+                "site": hit.site,
+                "url": hit.url,
+                "category": hit.category,
+            },
+        )
+        payload = finding.to_dict()
+        tagged = dict(payload)
+        tagged["_pipeline"] = _PIPELINE
+        findings_log.append(tagged)
+        await session.publish_event(_finding_event(_PIPELINE, payload))
+
+
+async def _run_breach_check(
+    session: SessionState, http, seen_emails: set[str]
+) -> None:
+    settings = get_settings()
+    if not seen_emails:
+        return
+    if not settings.hibp_api_key:
+        await session.publish_event(
+            _pipeline_status_event(
+                _PIPELINE,
+                "running",
+                "HIBP_API_KEY not configured; breach lookup skipped.",
+            )
+        )
+        return
+
+    findings_log: list[dict] = session.data.setdefault("findings", [])
+    for email in sorted(seen_emails):
+        try:
+            breaches = await _breach_check.check_email(
+                email, settings.hibp_api_key, http
+            )
+        except Exception:
+            continue
+        for breach in breaches:
+            risk = "CRITICAL" if breach.critical else "HIGH"
+            data_class_str = ", ".join(breach.data_classes) or "unknown"
+            finding = Finding(
+                source="hibp",
+                evidence_chain=[
+                    f"Email: {email}",
+                    f"Breach: {breach.title or breach.name}",
+                    f"Date: {breach.breach_date}",
+                    f"Data classes: {data_class_str}",
+                ],
+                confidence=0.9,
+                risk_level=risk,  # type: ignore[arg-type]
+                remediation=(
+                    f"Change the password used at {breach.domain or breach.name} "
+                    "and any service that reuses it. Enable 2FA. Monitor at "
+                    "haveibeenpwned.com."
+                ),
+                metadata={
+                    "email": email,
+                    "breach_name": breach.name,
+                    "breach_title": breach.title,
+                    "breach_date": breach.breach_date,
+                    "domain": breach.domain,
+                    "data_classes": list(breach.data_classes),
+                    "is_sensitive": breach.is_sensitive,
+                    "is_verified": breach.is_verified,
+                },
+            )
+            payload = finding.to_dict()
+            tagged = dict(payload)
+            tagged["_pipeline"] = _PIPELINE
+            findings_log.append(tagged)
+            await session.publish_event(_finding_event(_PIPELINE, payload))
+
+
+# ---------------------------------------------------------------------------
 # Entry point.
 # ---------------------------------------------------------------------------
 
@@ -412,11 +544,28 @@ async def run(session: SessionState) -> None:
         cost_tracker = session.data.get("cost_tracker")
 
         # 1. Build query list — base dorks + Sonnet-generated custom dorks.
-        base_queries = _base_queries(username, full_name)
+        # De-duplicate while preserving order: DorkER patterns overlap with
+        # the hand-written base queries (e.g. site:github.com "{username}").
         max_total = max(1, int(settings.web_footprint_max_queries))
-        max_custom = max(0, max_total - len(base_queries))
+        seen: set[str] = set()
+        deduped_base: list[str] = []
+        for q in _base_queries(username, full_name):
+            key = q.strip().lower()
+            if key and key not in seen:
+                seen.add(key)
+                deduped_base.append(q)
+            if len(deduped_base) >= max_total:
+                break
+        max_custom = max(0, max_total - len(deduped_base))
         custom_queries = await _generate_custom_queries(session, profile, max_custom)
-        all_queries = (base_queries + custom_queries)[:max_total]
+        all_queries: list[str] = list(deduped_base)
+        for q in custom_queries:
+            key = q.strip().lower()
+            if key and key not in seen:
+                seen.add(key)
+                all_queries.append(q)
+            if len(all_queries) >= max_total:
+                break
 
         if not all_queries:
             await session.publish_event(
@@ -435,6 +584,7 @@ async def run(session: SessionState) -> None:
 
         full_fetches_remaining = max(0, int(settings.web_footprint_max_full_fetches))
         seen_urls: set[str] = set()
+        seen_emails: set[str] = set()
 
         # 2-7. Run queries → triage → extract → emit.
         for idx, query in enumerate(all_queries):
@@ -548,6 +698,12 @@ async def run(session: SessionState) -> None:
                     tagged["_pipeline"] = _PIPELINE
                     findings_log.append(tagged)
                     await session.publish_event(_finding_event(_PIPELINE, payload))
+                    if _is_email_value(finding_type) and value:
+                        seen_emails.add(value.lower())
+
+        # ---- Post-dork pass: account probe + breach check ----------------
+        await _run_account_probe(session, username, http)
+        await _run_breach_check(session, http, seen_emails)
 
         await session.publish_event(_pipeline_status_event(_PIPELINE, "complete"))
     except Exception as exc:  # noqa: BLE001 — defensive top-level guard

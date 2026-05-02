@@ -45,6 +45,13 @@ def _env_int(key: str, default: int) -> int:
         return default
 
 
+def _env_bool(key: str, default: bool) -> bool:
+    raw = os.environ.get(key)
+    if raw is None or raw == "":
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
 @dataclass(frozen=True)
 class Settings:
     # Anthropic
@@ -74,6 +81,12 @@ class Settings:
     frontend_url: str
     session_cookie_name: str
     session_ttl_minutes: int
+
+    # Web-footprint Workstream C extras
+    hibp_api_key: str
+    intelbase_api_key: str
+    account_probe_enabled: bool
+    account_probe_max_concurrent: int
 
 
 @lru_cache(maxsize=1)
@@ -111,4 +124,8 @@ def get_settings() -> Settings:
         frontend_url=_env_str("FRONTEND_URL", "http://localhost:5173"),
         session_cookie_name=_env_str("SESSION_COOKIE_NAME", "shieldclaw_session"),
         session_ttl_minutes=_env_int("SESSION_TTL_MINUTES", 120),
+        hibp_api_key=_env_str("HIBP_API_KEY"),
+        intelbase_api_key=_env_str("INTELBASE_API_KEY"),
+        account_probe_enabled=_env_bool("ACCOUNT_PROBE_ENABLED", True),
+        account_probe_max_concurrent=_env_int("ACCOUNT_PROBE_MAX_CONCURRENT", 8),
     )

@@ -4,6 +4,7 @@ import AuditHeader from "./AuditHeader";
 import PipelineColumn from "./PipelineColumn";
 import RemediationDrawer from "./RemediationDrawer";
 import ExposureScore from "./ExposureScore";
+import GeoMap from "./GeoMap";
 
 interface Props {
   sessionId: string;
@@ -49,6 +50,10 @@ export default function AuditDashboard({ sessionId }: Props) {
             </div>
           </section>
         )}
+
+        <section className="mt-6">
+          <GeoMap findings={audit.findingsByPipeline.geolocation} />
+        </section>
 
         <section className="mt-6 grid grid-cols-1 gap-4 lg:grid-cols-3">
           {PIPELINES.map((p) => (

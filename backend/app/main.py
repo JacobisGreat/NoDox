@@ -24,10 +24,29 @@ async def lifespan(app: FastAPI):
     gc_task = asyncio.create_task(
         gc_loop(ttl_minutes=settings.session_ttl_minutes), name="session-gc"
     )
+
+    # Background-warm geoclip so the first audit doesn't pay the 30-90s
+    # cold start. Imported lazily because torch/geoclip may not be
+    # installed in dev / minimal environments.
+    async def _warm() -> None:
+        try:
+            from app.pipelines.geolocation import warm_geoclip
+
+            await warm_geoclip()
+        except Exception as exc:
+            logger.info("geoclip warm-up skipped: %s", exc)
+
+    warm_task = asyncio.create_task(_warm(), name="geoclip-warm")
+
     try:
         yield
     finally:
         gc_task.cancel()
+        warm_task.cancel()
+        try:
+            await warm_task
+        except (asyncio.CancelledError, Exception):
+            pass
         try:
             await gc_task
         except asyncio.CancelledError:

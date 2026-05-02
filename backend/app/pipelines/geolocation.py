@@ -31,6 +31,7 @@ from app.schemas.events import (
     pipeline_status as _pipeline_status_event,
 )
 from app.schemas.findings import Finding
+from app.services.media_enrichment import reverse_geocode_coords
 from app.session_store import SessionState
 
 try:
@@ -45,6 +46,7 @@ _PIPELINE = "geolocation"
 _MAX_POSTS = 20
 _MIN_SIGNALS_FOR_AGGREGATION = 3
 _GEOCLIP_MIN_CONFIDENCE = 0.10
+_GEOCLIP_FINDING_THRESHOLD = 0.20
 _CLUSTER_EMIT_THRESHOLD = 0.40
 
 # Rough cost estimates used for budget-gating before each call.
@@ -78,9 +80,15 @@ _AGGREGATOR_SYSTEM_PROMPT = (
 _geoclip_model: Any = None
 _geoclip_load_attempted = False
 _geoclip_load_error: str | None = None
+_geoclip_lock = asyncio.Lock()
+_geoclip_predict_lock: Any = None  # threading.Lock — created lazily
 
 
 def _load_geoclip_sync() -> Any:
+    """Synchronous loader. Always called under ``_geoclip_lock``.
+
+    Picks CUDA when available unless ``NODOX_GEOCLIP_DEVICE=cpu`` forces CPU.
+    """
     global _geoclip_model, _geoclip_load_attempted, _geoclip_load_error
     if _geoclip_model is not None or _geoclip_load_attempted:
         return _geoclip_model
@@ -88,11 +96,47 @@ def _load_geoclip_sync() -> Any:
     try:
         from geoclip import GeoCLIP  # type: ignore[import-not-found]
 
-        _geoclip_model = GeoCLIP()
+        model = GeoCLIP()
+        # GPU detection: opt-in via env, default to CUDA if available.
+        device_pref = os.environ.get("NODOX_GEOCLIP_DEVICE", "").lower()
+        if device_pref == "cpu":
+            target = "cpu"
+        else:
+            try:
+                import torch  # type: ignore[import-not-found]
+
+                target = "cuda" if torch.cuda.is_available() else "cpu"
+            except Exception:
+                target = "cpu"
+        if target != "cpu":
+            try:
+                model = model.to(target)
+            except Exception:
+                target = "cpu"
+        _geoclip_model = model
+        _geoclip_load_error = None
     except Exception as exc:  # noqa: BLE001 — any failure disables this channel
         _geoclip_load_error = str(exc)
         _geoclip_model = None
     return _geoclip_model
+
+
+async def _get_geoclip_model() -> Any:
+    """Async-safe lazy loader. Mirrors identity._get_sentence_model."""
+    if _geoclip_model is not None or _geoclip_load_attempted:
+        return _geoclip_model
+    async with _geoclip_lock:
+        if _geoclip_model is not None or _geoclip_load_attempted:
+            return _geoclip_model
+        return await asyncio.to_thread(_load_geoclip_sync)
+
+
+async def warm_geoclip() -> None:
+    """Pre-load geoclip during FastAPI startup so the first audit doesn't
+    pay the 30-90s cold start. Safe to call multiple times — no-op if
+    already loaded or previously failed.
+    """
+    await _get_geoclip_model()
 
 
 # ---------------------------------------------------------------------------
@@ -164,7 +208,12 @@ def _extract_gps_sync(image_bytes: bytes) -> tuple[float, float] | None:
 
 
 def _geoclip_predict_sync(image_bytes: bytes, top_k: int = 5) -> list[dict]:
-    model = _load_geoclip_sync()
+    global _geoclip_predict_lock
+    if _geoclip_predict_lock is None:
+        import threading
+
+        _geoclip_predict_lock = threading.Lock()
+    model = _geoclip_model
     if model is None:
         return []
     tmp_path: str | None = None
@@ -175,7 +224,10 @@ def _geoclip_predict_sync(image_bytes: bytes, top_k: int = 5) -> list[dict]:
         os.close(fd)
         with open(tmp_path, "wb") as f:
             f.write(image_bytes)
-        result = model.predict(tmp_path, top_k=top_k)
+        # Serialize torch forward passes to avoid state thrash under
+        # concurrent post processing.
+        with _geoclip_predict_lock:
+            result = model.predict(tmp_path, top_k=top_k)
     except Exception:
         return []
     finally:
@@ -406,12 +458,15 @@ async def _process_vlm(
 async def _process_geoclip(
     session: SessionState, post: dict, image_bytes: bytes
 ) -> list[dict]:
+    if await _get_geoclip_model() is None:
+        return []
     predictions = await asyncio.to_thread(_geoclip_predict_sync, image_bytes, 5)
     if not predictions:
         return []
     shortcode = post.get("shortcode") or "unknown"
     relevant: list[dict] = []
-    for pred in predictions:
+    top_emitted = False
+    for idx, pred in enumerate(predictions):
         conf = float(pred.get("confidence", 0.0))
         if conf < _GEOCLIP_MIN_CONFIDENCE:
             continue
@@ -429,6 +484,47 @@ async def _process_geoclip(
                 "lon": pred["lon"],
             }
         )
+        # Emit a per-post finding for the top prediction once it clears the
+        # finding threshold — the map needs lat/lon-bearing findings to plot.
+        if not top_emitted and idx == 0 and conf >= _GEOCLIP_FINDING_THRESHOLD:
+            top_emitted = True
+            place = await asyncio.to_thread(
+                reverse_geocode_coords, pred["lat"], pred["lon"]
+            )
+            place_label = place.display() if place else None
+            evidence = [
+                f"Post: {_shortcode_url(shortcode)}",
+                "GeoCLIP image-to-coordinate prediction",
+                f"Predicted coordinates: {pred['lat']:.4f}, {pred['lon']:.4f}",
+            ]
+            if place_label:
+                evidence.append(f"Reverse-geocoded location: {place_label}")
+            metadata: dict[str, Any] = {
+                "lat": pred["lat"],
+                "lon": pred["lon"],
+                "shortcode": shortcode,
+                "model_confidence": conf,
+            }
+            if place is not None:
+                metadata.update(
+                    city=place.city,
+                    country=place.country,
+                    country_code=place.country_code,
+                )
+            risk_level = "MEDIUM" if conf >= 0.40 else "LOW"
+            finding = Finding(
+                source="geoclip_prediction",
+                evidence_chain=evidence,
+                confidence=min(0.85, conf),
+                risk_level=risk_level,  # type: ignore[arg-type]
+                remediation=(
+                    "GeoCLIP inferred this post's likely region from visual "
+                    "cues alone. If the prediction is accurate, crop or remove "
+                    f"distinctive scenery in {_shortcode_url(shortcode)}."
+                ),
+                metadata=metadata,
+            )
+            await _emit_finding(session, finding)
     return relevant
 
 
@@ -456,13 +552,29 @@ async def _process_post(
     if coords is not None:
         lat, lon = coords
         shortcode = post.get("shortcode") or "unknown"
+        place = await asyncio.to_thread(reverse_geocode_coords, lat, lon)
+        place_label = place.display() if place else None
+        evidence = [
+            f"Post: {_shortcode_url(shortcode)}",
+            "EXIF GPSInfo present in uploaded image",
+            f"Decoded coordinates: {lat:.6f}, {lon:.6f}",
+        ]
+        if place_label:
+            evidence.append(f"Reverse-geocoded location: {place_label}")
+        finding_metadata: dict[str, Any] = {
+            "lat": lat,
+            "lon": lon,
+            "shortcode": shortcode,
+        }
+        if place is not None:
+            finding_metadata.update(
+                city=place.city,
+                country=place.country,
+                country_code=place.country_code,
+            )
         finding = Finding(
             source="exif_gps",
-            evidence_chain=[
-                f"Post: {_shortcode_url(shortcode)}",
-                "EXIF GPSInfo present in uploaded image",
-                f"Decoded coordinates: {lat:.6f}, {lon:.6f}",
-            ],
+            evidence_chain=evidence,
             confidence=0.95,
             risk_level="CRITICAL",
             remediation=(
@@ -470,18 +582,20 @@ async def _process_post(
                 "Privacy > remove location data from posts. Delete and "
                 f"re-upload post {_shortcode_url(shortcode)}"
             ),
-            metadata={"lat": lat, "lon": lon, "shortcode": shortcode},
+            metadata=finding_metadata,
         )
         await _emit_finding(session, finding)
         signals.append(
             {
                 "type": "exif_gps",
                 "description": "EXIF GPS coordinates",
-                "location_hint": f"{lat:.4f}, {lon:.4f}",
+                "location_hint": place_label or f"{lat:.4f}, {lon:.4f}",
                 "confidence": 0.95,
                 "shortcode": shortcode,
                 "lat": lat,
                 "lon": lon,
+                "city": place.city if place else None,
+                "country": place.country if place else None,
             }
         )
 

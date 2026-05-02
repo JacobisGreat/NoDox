@@ -13,3 +13,6 @@ frontend/vite.config.d.ts
 frontend/vite.config.js
 
 .pytest_cache/
+
+# Vendored third-party OSINT tools used as data/inspiration only
+systems/

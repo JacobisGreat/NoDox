@@ -1,20 +1,27 @@
 """Identity cross-reference pipeline.
 
-For every platform in ``data/platforms.json``:
-    * issue an HTTP GET (or HEAD) at ``url_template.format(username=ig_username)``
-    * if the response status is in ``valid_status`` AND none of the
-      ``error_indicators`` are visible in the body's first 2 kB, treat the
-      account as a possible match
-    * for each candidate, score the match with a weighted blend of:
-        - username equality (normalized, given)
-        - display-name fuzzy similarity (rapidfuzz)
-        - profile-pic perceptual hash similarity (imagehash)
-        - bio cosine similarity (sentence-transformers, lazy load)
-    * emit a ``finding`` event immediately (never buffer)
+For every platform in ``data/sherlock_data.json`` we issue an HTTP request
+and apply Sherlock's matching semantics to decide if ``ig_username`` is
+claimed on that site:
 
-The whole thing runs at ``Semaphore(30)`` concurrency. We aggressively
-swallow per-platform exceptions; one site flaking should not stop the
-audit.
+    * ``status_code`` — site exists if the response code is NOT in the
+      configured ``errorCode`` list (default: anything outside 2xx is a
+      "doesn't exist").
+    * ``message`` — site exists if NONE of the configured error strings
+      appear in the response body.
+    * ``response_url`` — redirects are disabled; a 2xx means the user
+      exists, anything else (typically a 30x) means a redirect to an
+      error landing page.
+
+When multiple ``errorType`` values are listed, ANY one of them saying
+"user doesn't exist" wins — matching Sherlock upstream.
+
+Confirmed accounts get scored against the Instagram baseline (display
+name fuzzy match, profile-pic perceptual hash, bio embedding cosine).
+A clearly-non-matching display name applies a confidence penalty so
+generic landing pages don't get reported as "MEDIUM" hits.
+
+Findings stream out one at a time so the dashboard renders live.
 """
 
 from __future__ import annotations
@@ -28,7 +35,7 @@ from urllib.parse import urljoin, urlparse
 
 import httpx
 
-from app.data.loader import load_platforms, render_url
+from app.data.loader import HIGH_RISK_PLATFORMS, load_platforms, render_url
 from app.schemas.events import (
     finding as _finding_event,
 )
@@ -43,19 +50,36 @@ logger = logging.getLogger(__name__)
 PIPELINE_NAME = "identity"
 
 _CONCURRENCY = 30
-_REQUEST_TIMEOUT = httpx.Timeout(5.0, connect=5.0)
-_BODY_SCAN_BYTES = 2000
+_REQUEST_TIMEOUT = httpx.Timeout(8.0, connect=5.0)
+_BODY_SCAN_BYTES = 4000
+# Cap how much of the body we feed into the message-detector. Sherlock
+# scans the entire body but most matches are within the first few KB and
+# scanning megabytes of HTML hurts throughput.
+_BODY_MATCH_BYTES = 200_000
 
 # Bumped to HIGH if matched on a high-blast-radius platform.
-_HIGH_RISK_PLATFORMS = {"LinkedIn", "GitHub", "Reddit", "Facebook"}
+_HIGH_RISK_PLATFORMS = HIGH_RISK_PLATFORMS
 
 _HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
     "Accept": (
         "text/html,application/xhtml+xml,application/xml;q=0.9,"
         "image/webp,image/avif,*/*;q=0.8"
     ),
     "Accept-Language": "en-US,en;q=0.9",
 }
+
+# Direct copy of Sherlock's WAF challenge fingerprints (sherlock.py).
+_WAF_FINGERPRINTS: tuple[str, ...] = (
+    ".loading-spinner{visibility:hidden}body.no-js .challenge-running",
+    '<span id="challenge-error-text">',
+    "AwsWafIntegration.forceRefreshToken",
+    "perimeterxIdentifiers",
+)
 
 _TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
 _OG_TITLE_RE = re.compile(
@@ -153,7 +177,6 @@ def _token_sort_ratio(a: str, b: str) -> float:
         return float(fuzz.token_sort_ratio(a, b)) / 100.0
     except Exception as exc:
         logger.debug("rapidfuzz unavailable: %s", exc)
-        # Fallback: simple ratio of common-token length.
         ta = set(a.lower().split())
         tb = set(b.lower().split())
         if not ta or not tb:
@@ -204,16 +227,6 @@ def _extract_image(snippet: str, base_url: str) -> str | None:
     return None
 
 
-def _has_error_indicator(snippet: str, indicators: list[str]) -> bool:
-    if not indicators:
-        return False
-    lowered = snippet.lower()
-    for needle in indicators:
-        if needle and needle.lower() in lowered:
-            return True
-    return False
-
-
 def _hamming_score(a: Any | None, b: Any | None) -> float | None:
     if a is None or b is None:
         return None
@@ -229,7 +242,7 @@ def _hamming_score(a: Any | None, b: Any | None) -> float | None:
 def _risk_for(confidence: float, platform_name: str) -> str:
     if confidence >= 0.8:
         risk = "HIGH"
-    elif confidence >= 0.5:
+    elif confidence >= 0.55:
         risk = "MEDIUM"
     else:
         risk = "LOW"
@@ -242,8 +255,8 @@ def _platform_remediation(name: str, url: str, category: str) -> str:
     if category == "professional":
         return (
             f"Review and lock down the public profile at {url}. "
-            "If it is not yours, report the impersonating account to {name}."
-        ).format(name=name)
+            f"If it is not yours, report the impersonating account to {name}."
+        )
     if category in {"commerce", "messaging"}:
         return (
             f"If this {name} account at {url} is yours, set it to private or "
@@ -253,6 +266,74 @@ def _platform_remediation(name: str, url: str, category: str) -> str:
         f"Delete or rename the {name} account at {url}, "
         "or set the profile to private if you intend to keep it."
     )
+
+
+# --------------------------------------------------------------------- #
+# Sherlock-compatible matching                                          #
+# --------------------------------------------------------------------- #
+
+
+def _looks_like_waf(body: str) -> bool:
+    if not body:
+        return False
+    return any(sig in body for sig in _WAF_FINGERPRINTS)
+
+
+def _substitute_payload(value: Any, username: str) -> Any:
+    """Recursively substitute Sherlock's ``{}`` placeholder in a request
+    payload (Anilist's GraphQL query, Discord's username probe, etc.)."""
+    if isinstance(value, str):
+        if "{}" in value:
+            return value.replace("{}", username)
+        if "{username}" in value:
+            return value.replace("{username}", username)
+        return value
+    if isinstance(value, dict):
+        return {k: _substitute_payload(v, username) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_substitute_payload(v, username) for v in value]
+    return value
+
+
+def _is_claimed(
+    platform: dict[str, Any],
+    status_code: int,
+    body_for_match: str,
+) -> bool:
+    """Apply Sherlock's matching to decide if the username is claimed.
+
+    Returns True iff *every* declared errorType says "claimed". As soon
+    as one says "available", we bail. (Sherlock's effective semantics:
+    once AVAILABLE is set, later checks don't override.)
+    """
+    error_types: list[str] = list(platform.get("error_types") or [])
+    if not error_types:
+        error_types = ["status_code"]
+
+    for et in error_types:
+        if et == "message":
+            messages: list[str] = platform.get("error_messages") or []
+            if any(msg and msg in body_for_match for msg in messages):
+                return False  # error string present → user not found
+        elif et == "status_code":
+            error_codes: list[int] = platform.get("error_codes") or []
+            if error_codes:
+                if status_code in error_codes:
+                    return False
+            elif not (200 <= status_code < 300):
+                return False
+        elif et == "response_url":
+            # Caller turned redirects OFF for response_url sites. A non-2xx
+            # response (typically a 30x to the error page) means the user
+            # doesn't exist.
+            if not (200 <= status_code < 300):
+                return False
+        else:
+            logger.debug(
+                "Unknown errorType %r on %s; skipping", et, platform.get("name")
+            )
+            return False
+    return True
 
 
 # --------------------------------------------------------------------- #
@@ -271,49 +352,81 @@ async def _check_platform(
     sentence_model: Any | None,
     semaphore: asyncio.Semaphore,
 ) -> Finding | None:
-    name = platform["name"]
-    url = render_url(platform["url_template"], username)
-    method = platform.get("method", "GET").upper()
-    valid_status = platform.get("valid_status", [200])
-    indicators = platform.get("error_indicators", [])
+    name: str = platform["name"]
+
+    # Per-site username regex — skip without ever issuing a request.
+    regex_check = platform.get("regex_check")
+    if regex_check:
+        try:
+            if not re.match(regex_check, username):
+                return None
+        except re.error:
+            pass
+
+    # response_url sites need redirects disabled — see Sherlock semantics.
+    error_types: list[str] = list(platform.get("error_types") or ["status_code"])
+    follow_redirects = "response_url" not in error_types
+
+    method = (platform.get("method") or "GET").upper()
+    probe_url = render_url(platform["probe_template"], username)
+    display_url = render_url(platform["url_template"], username)
+
+    # Lower-case keys so per-site overrides REPLACE the defaults instead
+    # of producing duplicate headers (httpx would join them with ', ').
+    request_headers = {k.lower(): v for k, v in _HEADERS.items()}
+    extra_headers = platform.get("headers") or {}
+    if isinstance(extra_headers, dict):
+        for k, v in extra_headers.items():
+            if v is None:
+                continue
+            request_headers[str(k).lower()] = str(v)
+
+    request_kwargs: dict[str, Any] = {
+        "headers": request_headers,
+        "timeout": _REQUEST_TIMEOUT,
+        "follow_redirects": follow_redirects,
+    }
+    payload = platform.get("request_payload")
+    if isinstance(payload, dict) and method in {"POST", "PUT"}:
+        request_kwargs["json"] = _substitute_payload(payload, username)
 
     async with semaphore:
         try:
-            resp = await http.request(
-                method,
-                url,
-                headers=_HEADERS,
-                timeout=_REQUEST_TIMEOUT,
-                follow_redirects=True,
-            )
+            resp = await http.request(method, probe_url, **request_kwargs)
         except (httpx.HTTPError, asyncio.TimeoutError) as exc:
-            logger.debug("Skipping %s (%s): %s", name, url, exc)
+            logger.debug("Skipping %s (%s): %s", name, probe_url, exc)
             return None
         except Exception as exc:
             logger.debug("Unexpected error checking %s: %s", name, exc)
             return None
 
-        if resp.status_code not in valid_status:
-            return None
-
         try:
-            body = resp.text or ""
+            body_full = resp.text or ""
         except Exception:
-            body = ""
-        snippet = body[:_BODY_SCAN_BYTES]
-        if _has_error_indicator(snippet, indicators):
-            return None
+            body_full = ""
+
+    body_for_match = body_full[:_BODY_MATCH_BYTES]
+
+    # WAF / anti-bot challenge → inconclusive, don't emit.
+    if _looks_like_waf(body_for_match):
+        return None
+
+    if not _is_claimed(platform, resp.status_code, body_for_match):
+        return None
 
     # ---------- scoring ----------
+    snippet = body_full[:_BODY_SCAN_BYTES]
     display_name = _extract_display_name(snippet) or ""
     bio_text = _extract_bio(snippet) or ""
 
     name_similarity = (
-        _token_sort_ratio(full_name, display_name) if full_name and display_name else 0.0
+        _token_sort_ratio(full_name, display_name)
+        if full_name and display_name
+        else 0.0
     )
 
     photo_similarity: float | None = None
-    candidate_image_url = _extract_image(snippet, url)
+    candidate_image_url = _extract_image(snippet, display_url)
     if candidate_image_url and ig_phash is not None and image_downloader is not None:
         try:
             img_bytes, _ = await image_downloader.download(candidate_image_url)
@@ -339,10 +452,11 @@ async def _check_platform(
             logger.debug("bio compare failed for %s: %s", name, exc)
             bio_similarity = None
 
-    weights: list[tuple[float, float]] = []
-    weights.append((0.30, 1.0))  # username matched (we issued the URL)
-    if display_name:
-        weights.append((0.30, max(0.0, min(1.0, name_similarity))))
+    # Weighted-mean confidence. Bare URL hit (Sherlock-confirmed) is
+    # 0.30; a strong corroborating signal can push it higher.
+    weights: list[tuple[float, float]] = [(0.30, 1.0)]
+    if display_name and name_similarity >= 0.4:
+        weights.append((0.35, max(0.0, min(1.0, name_similarity))))
     if photo_similarity is not None:
         weights.append((0.25, max(0.0, min(1.0, photo_similarity))))
     if bio_similarity is not None:
@@ -355,10 +469,18 @@ async def _check_platform(
         score_sum = sum(w * s for w, s in weights)
         confidence = score_sum / weight_sum if weight_sum else 0.0
 
+    # Penalty: page rendered a clearly non-matching display name. This
+    # is what a generic site landing page looks like ("TikTok - Make
+    # Your Day"). 30% confidence haircut.
+    if display_name and full_name and name_similarity < 0.15:
+        confidence *= 0.7
+
     confidence = round(max(0.0, min(1.0, confidence)), 3)
     risk = _risk_for(confidence, name)
 
-    evidence: list[str] = [f"Username '{username}' resolves to a live page at {url}"]
+    evidence: list[str] = [
+        f"Username '{username}' resolves to a live page at {display_url}"
+    ]
     if display_name:
         evidence.append(
             f"Page display name '{display_name[:120]}' "
@@ -371,15 +493,14 @@ async def _check_platform(
         )
     if bio_similarity is not None:
         evidence.append(
-            f"Bio text overlaps Instagram bio "
-            f"(cosine {bio_similarity:.2f})"
+            f"Bio text overlaps Instagram bio (cosine {bio_similarity:.2f})"
         )
 
     metadata = {
         "platform": name,
-        "category": platform.get("category", "other"),
-        "url": url,
-        "host": urlparse(url).netloc,
+        "category": platform.get("category", "social_media"),
+        "url": display_url,
+        "host": urlparse(display_url).netloc,
         "name_similarity": round(name_similarity, 3) if display_name else None,
         "photo_similarity": (
             round(photo_similarity, 3) if photo_similarity is not None else None
@@ -388,9 +509,13 @@ async def _check_platform(
             round(bio_similarity, 3) if bio_similarity is not None else None
         ),
         "display_name": display_name or None,
+        "detection": "+".join(error_types),
+        "nsfw": bool(platform.get("nsfw", False)),
     }
 
-    remediation = _platform_remediation(name, url, platform.get("category", "other"))
+    remediation = _platform_remediation(
+        name, display_url, platform.get("category", "social_media")
+    )
 
     return Finding(
         source=f"identity:{name}",
@@ -438,7 +563,6 @@ async def run(session: SessionState) -> None:
 
         image_downloader = session.data.get("image_downloader")
 
-        # Pre-load reference profile picture (best effort).
         ig_phash: Any | None = None
         if profile_pic_url and image_downloader is not None:
             try:
@@ -486,7 +610,9 @@ async def run(session: SessionState) -> None:
         outcomes[PIPELINE_NAME] = "complete"
         await session.publish_event(
             _pipeline_status_event(
-                PIPELINE_NAME, "complete", f"{emitted} match(es) across {len(platforms)} platforms"
+                PIPELINE_NAME,
+                "complete",
+                f"{emitted} match(es) across {len(platforms)} platforms",
             )
         )
     except asyncio.CancelledError:

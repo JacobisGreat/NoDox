@@ -74,6 +74,7 @@ export type FetchProfileErrorKind =
   | "not_found"
   | "private"
   | "rate_limited"
+  | "validation"
   | "generic";
 
 export class FetchProfileError extends Error {

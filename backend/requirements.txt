@@ -12,3 +12,23 @@ google-api-python-client>=2.140.0
 beautifulsoup4>=4.12.0
 lxml>=5.2.0
 numpy>=1.26.0
+
+# --- Geolocation / media (Workstream B) ---
+# torch is needed by geoclip. On Windows without CUDA you'll get the CPU
+# wheel automatically; first geoclip run downloads CLIP-L (~1.7 GB) into the
+# Hugging Face cache.
+torch>=2.0.0
+torchvision>=0.15.0
+transformers>=4.41.0
+# Editable install of the vendored geoclip checkout. Run from repo root:
+#   pip install -e ./systems/geo-clip
+# We don't pin it as a PyPI dep because the local checkout is the source of truth.
+reverse-geocode>=1.6.5
+# Optional OCR. If the Tesseract binary is on PATH (Windows: choco install
+# tesseract; macOS: brew install tesseract), the media pipeline will run
+# OCR over post images. Otherwise the OCR branch no-ops gracefully.
+pytesseract>=0.3.10
+
+# --- dev / test ---
+pytest>=8.3.0
+pytest-asyncio>=0.24.0
