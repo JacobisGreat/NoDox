@@ -11,19 +11,21 @@ export default function ExposureScore({ aggregator, compact = false }: Props) {
     return (
       <div
         className={`flex items-center gap-3 ${
-          compact ? "" : "border border-nodoxx-border bg-nodoxx-panel px-4 py-3"
+          compact ? "" : "border border-kali-border bg-kali-surface px-4 py-3"
         }`}
       >
         <span
           aria-hidden="true"
-          className="inline-block h-3 w-3 animate-spin rounded-full border-2 border-nodoxx-dim border-t-nodoxx-text"
-        />
+          className="font-mono text-[13px] text-kali-text animate-running-pulse"
+        >
+          [...]
+        </span>
         <div className="flex flex-col">
-          <span className="text-[10px] font-mono uppercase tracking-[0.2em] text-nodoxx-muted">
+          <span className="font-mono text-[10px] uppercase tracking-label text-kali-label">
             exposure
           </span>
-          <span className="font-mono text-xs text-nodoxx-muted">
-            calculating...
+          <span className="font-mono text-[11px] text-kali-dim">
+            calculating
           </span>
         </div>
       </div>
@@ -37,7 +39,7 @@ export default function ExposureScore({ aggregator, compact = false }: Props) {
   if (compact) {
     return (
       <div className="flex items-baseline gap-2">
-        <span className="text-[10px] font-mono uppercase tracking-[0.2em] text-nodoxx-muted">
+        <span className="font-mono text-[10px] uppercase tracking-label text-kali-label">
           exposure
         </span>
         <span
@@ -46,9 +48,9 @@ export default function ExposureScore({ aggregator, compact = false }: Props) {
         >
           {score}
         </span>
-        <span className="font-mono text-xs text-nodoxx-muted">/ 100</span>
+        <span className="font-mono text-[11px] text-kali-dim">/ 100</span>
         <span
-          className="ml-1 border px-1.5 py-0.5 font-mono text-[10px] font-semibold uppercase tracking-[0.16em]"
+          className="ml-1 border px-1.5 py-0.5 font-mono text-[10px] font-bold uppercase tracking-label"
           style={{ color, borderColor: color }}
         >
           {label}
@@ -58,9 +60,9 @@ export default function ExposureScore({ aggregator, compact = false }: Props) {
   }
 
   return (
-    <section className="border border-nodoxx-border bg-nodoxx-panel p-6">
+    <section className="border border-kali-border bg-kali-surface p-6 transition-colors hover:border-kali-text">
       <div className="flex items-center gap-2">
-        <span className="text-[10px] font-mono uppercase tracking-[0.2em] text-nodoxx-muted">
+        <span className="font-mono text-[10px] uppercase tracking-label text-kali-label">
           // exposure score
         </span>
       </div>
@@ -71,21 +73,21 @@ export default function ExposureScore({ aggregator, compact = false }: Props) {
         >
           {score}
         </span>
-        <span className="pb-2 font-mono text-base text-nodoxx-muted">
+        <span className="pb-2 font-mono text-base text-kali-dim">
           / 100
         </span>
         <span
-          className="mb-2 border px-2 py-0.5 font-mono text-xs font-semibold uppercase tracking-[0.18em]"
+          className="mb-2 border px-2 py-0.5 font-mono text-[11px] font-bold uppercase tracking-label"
           style={{ color, borderColor: color }}
           aria-label={`Risk band: ${label}`}
         >
           {label}
         </span>
       </div>
-      <p className="mt-2 max-w-2xl font-mono text-xs uppercase tracking-[0.18em] text-nodoxx-muted">
+      <p className="mt-3 max-w-2xl font-mono text-[11px] uppercase tracking-label text-kali-label">
         {exposureBlurb(aggregator.exposure_score)}
       </p>
-      <p className="mt-3 max-w-2xl font-mono text-sm leading-relaxed text-nodoxx-text/90">
+      <p className="prose mt-4 text-[14px] text-kali-text">
         {aggregator.summary}
       </p>
     </section>

@@ -3,7 +3,7 @@ import {
   confidenceColor,
   formatConfidence,
   riskBgClass,
-  riskBorderColor,
+  severityPrefix,
   splitUrls,
 } from "../utils/format";
 
@@ -11,60 +11,28 @@ interface Props {
   finding: Finding;
 }
 
-// Pre-attentive severity encoding inside a B&W constraint. Brightness alone
-// (a single channel) doesn't make HIGH/CRITICAL pop in a scrolling list, so
-// we widen the encoding across border-thickness, surface-tint, and source-
-// label brightness. Treisman's pre-attentive feature theory: the eye locks
-// onto the thicker bar + brighter surface in <200ms without reading.
-const SEVERITY_TREATMENT: Record<
-  Finding["risk_level"],
-  { borderWidth: number; panelClass: string; sourceClass: string }
-> = {
-  LOW: {
-    borderWidth: 2,
-    panelClass: "border border-nodoxx-border bg-nodoxx-panel2",
-    sourceClass: "text-nodoxx-muted",
-  },
-  MEDIUM: {
-    borderWidth: 3,
-    panelClass: "border border-nodoxx-border bg-nodoxx-panel2",
-    sourceClass: "text-nodoxx-muted",
-  },
-  HIGH: {
-    borderWidth: 4,
-    panelClass: "border border-nodoxx-border bg-white/[0.03]",
-    sourceClass: "text-nodoxx-text",
-  },
-  CRITICAL: {
-    borderWidth: 5,
-    panelClass: "border border-nodoxx-text/40 bg-white/[0.05]",
-    sourceClass: "text-nodoxx-text",
-  },
+const SOURCE_CLASS: Record<Finding["risk_level"], string> = {
+  LOW: "text-kali-dim",
+  MEDIUM: "text-kali-dim",
+  HIGH: "text-kali-text",
+  CRITICAL: "text-kali-text",
 };
 
 export default function FindingCard({ finding }: Props) {
-  const borderColor = riskBorderColor(finding.risk_level);
   const confColor = confidenceColor(finding.confidence);
   const confidencePct = Math.max(0, Math.min(1, finding.confidence)) * 100;
-  const treat =
-    SEVERITY_TREATMENT[finding.risk_level] ?? SEVERITY_TREATMENT.MEDIUM;
 
   return (
-    <article
-      className={`animate-card-in ${treat.panelClass}`}
-      style={{ borderLeft: `${treat.borderWidth}px solid ${borderColor}` }}
-    >
+    <article className="border border-kali-border bg-kali-surface transition-colors hover:border-kali-text">
       <div className="space-y-3 p-4">
         <header className="flex items-start justify-between gap-3">
           <span
-            className={`font-mono text-[11px] font-semibold uppercase tracking-[0.18em] ${treat.sourceClass}`}
+            className={`font-mono text-[11px] font-bold uppercase tracking-label ${SOURCE_CLASS[finding.risk_level]}`}
           >
-            // {finding.source}
+            {severityPrefix(finding.risk_level)} // {finding.source}
           </span>
           <span
-            className={`shrink-0 border px-2 py-0.5 font-mono text-[10px] font-semibold uppercase tracking-[0.18em] ${riskBgClass(
-              finding.risk_level,
-            )}`}
+            className={`shrink-0 border px-2 py-0.5 font-mono text-[10px] font-bold uppercase tracking-label ${riskBgClass(finding.risk_level)}`}
           >
             {finding.risk_level}
           </span>
@@ -75,11 +43,11 @@ export default function FindingCard({ finding }: Props) {
             {finding.evidence_chain.map((item, idx) => (
               <li
                 key={idx}
-                className="flex gap-2 font-mono text-[13px] leading-relaxed text-nodoxx-text/90"
+                className="flex gap-2 font-mono text-[13px] leading-relaxed text-kali-text"
               >
                 <span
                   aria-hidden="true"
-                  className="select-none pt-0.5 font-mono text-xs text-nodoxx-muted"
+                  className="select-none pt-0.5 font-mono text-kali-dim"
                 >
                   &gt;
                 </span>
@@ -92,16 +60,16 @@ export default function FindingCard({ finding }: Props) {
         )}
 
         <div className="flex items-center gap-3">
-          <span className="text-[10px] font-mono uppercase tracking-[0.2em] text-nodoxx-muted">
+          <span className="font-mono text-[10px] uppercase tracking-label text-kali-label">
             conf
           </span>
           <span
-            className="font-mono text-sm font-semibold tabular-nums"
+            className="font-mono text-[13px] font-bold tabular-nums"
             style={{ color: confColor }}
           >
             {formatConfidence(finding.confidence)}
           </span>
-          <div className="relative h-[3px] flex-1 overflow-hidden bg-nodoxx-bg">
+          <div className="relative h-[3px] flex-1 overflow-hidden bg-kali-bg">
             <div
               className="h-full transition-[width] duration-500"
               style={{ width: `${confidencePct}%`, backgroundColor: confColor }}
@@ -109,11 +77,13 @@ export default function FindingCard({ finding }: Props) {
           </div>
         </div>
 
-        <div className="border-l-2 border-nodoxx-text/70 bg-nodoxx-bg px-3 py-2 font-mono text-[13px] text-nodoxx-text/90">
-          <span className="mb-0.5 block font-mono text-[10px] uppercase tracking-[0.2em] text-nodoxx-muted">
+        <div className="border-l border-kali-text bg-kali-bg px-3 py-2">
+          <span className="mb-1 block font-mono text-[10px] uppercase tracking-label text-kali-label">
             $ remediation
           </span>
-          <span className="leading-relaxed">{finding.remediation}</span>
+          <p className="prose text-[14px] text-kali-text">
+            {finding.remediation}
+          </p>
         </div>
       </div>
     </article>
@@ -130,7 +100,7 @@ function renderEvidence(text: string) {
           href={seg.value}
           target="_blank"
           rel="noopener noreferrer"
-          className="font-mono text-nodoxx-text underline decoration-nodoxx-muted underline-offset-2 hover:decoration-nodoxx-text break-all"
+          className="font-mono text-kali-text underline decoration-kali-dim underline-offset-2 hover:decoration-kali-text break-all"
         >
           {seg.value}
         </a>

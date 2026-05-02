@@ -5,8 +5,6 @@ import { FetchProfileError } from "../types";
 const SUBTITLE = "see what strangers can find about you on instagram.";
 const TYPE_INTERVAL_MS = 24;
 
-// Static ASCII banner. Pre-rendered (not animated) so it stays crisp and
-// doesn't compete with the typewriter or matrix rain for attention.
 const BANNER = String.raw`
  _   _  ___  ____   ___ __  __
 | \ | |/ _ \|  _ \ / _ \\ \/ /
@@ -70,58 +68,49 @@ export default function LandingPage() {
   }
 
   return (
-    <main className="min-h-[100dvh] w-full flex items-center justify-center px-4 py-10">
-      <section className="relative w-full max-w-2xl border border-nodoxx-border bg-nodoxx-bg/85 backdrop-blur-sm shadow-[0_0_0_1px_rgba(255,255,255,0.04),0_24px_60px_-20px_rgba(0,0,0,0.8)]">
-        {/* Terminal title bar — fake window chrome, flat, monochrome. */}
-        <div className="flex items-center justify-between border-b border-nodoxx-border px-4 py-2 font-mono text-[10px] uppercase tracking-[0.22em] text-nodoxx-muted">
-          <span className="flex items-center gap-2">
-            <span className="h-2 w-2 border border-nodoxx-muted/60" />
-            <span className="h-2 w-2 border border-nodoxx-muted/60" />
-            <span className="h-2 w-2 border border-nodoxx-muted/60" />
-          </span>
+    <main className="flex min-h-[calc(100dvh-32px)] w-full items-center justify-center px-4 py-10 sm:px-6">
+      <section className="w-full max-w-2xl border border-kali-border bg-kali-surface">
+        <div className="flex items-center justify-between border-b border-kali-border px-4 py-2 font-mono text-[10px] uppercase tracking-label text-kali-label">
           <span>nodoxx@local: ~/audit</span>
           <span aria-hidden="true">[ssh]</span>
         </div>
 
         <div className="px-6 py-8 sm:px-10 sm:py-10">
-          {/* ASCII-art banner. Hidden on narrow phones where it would wrap
-              unattractively; the typed subtitle + corner caret carry the
-              brand on those breakpoints. */}
           <pre
             aria-label="NODOXX"
-            className="hidden sm:block whitespace-pre font-mono text-[11px] leading-[1.05] font-bold text-nodoxx-text select-none"
+            className="hidden sm:block whitespace-pre font-mono text-[11px] leading-[1.05] font-bold text-kali-text select-none"
           >
             {BANNER}
           </pre>
-          <h1 className="sm:hidden font-mono font-bold text-nodoxx-text tracking-[0.22em] text-4xl select-none">
+          <h1 className="sm:hidden font-mono text-4xl font-bold tracking-label text-kali-text select-none">
             NODOXX
           </h1>
 
-          <div className="mt-5 font-mono text-xs sm:text-sm leading-relaxed text-nodoxx-muted">
-            <span className="text-nodoxx-text">$ </span>
-            <span className="text-nodoxx-text">./nodoxx --help</span>
+          <div className="mt-6 font-mono text-[13px] leading-relaxed text-kali-text">
+            <span>$ </span>
+            <span>./nodoxx --help</span>
           </div>
-          <p className="mt-1 font-mono text-xs sm:text-sm leading-relaxed text-nodoxx-text/90 min-h-[1.5em]">
+          <p className="mt-1 min-h-[1.5em] font-mono text-[13px] leading-relaxed text-kali-text">
             {typed}
             <span
               aria-hidden="true"
-              className={`ml-0.5 inline-block h-[0.85em] w-[0.5ch] -translate-y-[0.06em] bg-nodoxx-text align-middle ${
+              className={`ml-0.5 inline-block h-[0.85em] w-[0.5ch] bg-kali-text align-middle ${
                 typedDone ? "animate-caret-blink" : ""
               }`}
             />
           </p>
-          <p className="mt-1 font-mono text-[11px] leading-relaxed text-nodoxx-muted">
+          <p className="mt-2 font-mono text-[11px] leading-relaxed uppercase tracking-label text-kali-label">
             consent-based osint self-audit &middot; identity &middot;
             geolocation &middot; web footprint
           </p>
 
           <form onSubmit={onSubmit} className="mt-8 space-y-3">
             <label className="block">
-              <span className="mb-1.5 block font-mono text-[10px] uppercase tracking-[0.22em] text-nodoxx-muted">
+              <span className="mb-2 block font-mono text-[10px] uppercase tracking-label text-kali-label">
                 [target.username]
               </span>
-              <div className="flex items-center border border-nodoxx-border bg-nodoxx-panel px-3 transition-colors focus-within:border-nodoxx-text">
-                <span className="select-none pr-2 font-mono text-base text-nodoxx-muted">
+              <div className="flex h-9 items-center rounded-input border border-kali-border bg-kali-bg px-3 transition-colors focus-within:border-kali-text">
+                <span className="select-none pr-2 font-mono text-[13px] text-kali-dim">
                   &gt;
                 </span>
                 <input
@@ -134,7 +123,7 @@ export default function LandingPage() {
                   onChange={(e) => setUsername(e.target.value)}
                   placeholder="username"
                   disabled={submitting}
-                  className="w-full bg-transparent py-3 pr-2 font-mono text-base text-nodoxx-text placeholder-nodoxx-dim outline-none disabled:opacity-60"
+                  className="h-full w-full bg-transparent font-mono text-[13px] text-kali-text placeholder-kali-label outline-none disabled:opacity-60"
                 />
               </div>
             </label>
@@ -142,44 +131,28 @@ export default function LandingPage() {
             <button
               type="submit"
               disabled={!canSubmit}
-              className="flex w-full items-center justify-center gap-3 border border-nodoxx-text bg-nodoxx-text py-3 px-4 font-mono text-sm font-semibold uppercase tracking-[0.22em] text-nodoxx-bg transition-[background-color,color,border-color] hover:bg-nodoxx-bg hover:text-nodoxx-text active:translate-y-[1px] disabled:cursor-not-allowed disabled:border-nodoxx-border disabled:bg-transparent disabled:text-nodoxx-dim disabled:active:translate-y-0"
+              className="flex h-9 w-full items-center justify-center gap-2 border border-kali-text bg-kali-text px-3 font-mono text-[13px] font-bold uppercase tracking-label text-kali-bg transition-colors hover:bg-kali-bg hover:text-kali-text disabled:cursor-not-allowed disabled:border-kali-border disabled:bg-kali-bg disabled:text-kali-label"
             >
-              {submitting ? (
-                <>
-                  <Spinner />
-                  <span>fetching...</span>
-                </>
-              ) : (
-                <span>./run_audit</span>
-              )}
+              {submitting ? <span>[...] fetching</span> : <span>$ ./run_audit</span>}
             </button>
 
             {error ? (
               <p
-                className="border border-nodoxx-text/40 bg-white/[0.04] px-3 py-2 font-mono text-xs text-nodoxx-text"
+                className="border border-kali-border bg-kali-bg px-3 py-2 font-mono text-[13px] text-kali-text"
                 role="alert"
               >
-                <span className="text-nodoxx-muted">err: </span>
+                <span className="text-kali-label">[err] </span>
                 {error}
               </p>
             ) : null}
           </form>
 
-          <footer className="mt-8 flex items-center justify-between border-t border-nodoxx-border pt-4 font-mono text-[10px] uppercase tracking-[0.2em] text-nodoxx-muted">
+          <footer className="mt-8 flex items-center justify-between border-t border-kali-border pt-4 font-mono text-[10px] uppercase tracking-label text-kali-label">
             <span>// public data, with consent</span>
             <span aria-hidden="true">[ enter ]</span>
           </footer>
         </div>
       </section>
     </main>
-  );
-}
-
-function Spinner() {
-  return (
-    <span
-      aria-hidden="true"
-      className="inline-block h-4 w-4 animate-spin rounded-full border-2 border-nodoxx-bg/30 border-t-nodoxx-bg"
-    />
   );
 }

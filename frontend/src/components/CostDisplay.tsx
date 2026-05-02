@@ -18,12 +18,12 @@ export default function CostDisplay({ cost, tick }: Props) {
 
   return (
     <div className="flex items-baseline gap-2">
-      <span className="text-[10px] font-mono uppercase tracking-[0.2em] text-nodoxx-muted">
+      <span className="font-mono text-[10px] uppercase tracking-label text-kali-label">
         cost
       </span>
       <span
-        className={`font-mono text-sm tabular-nums transition-colors duration-500 ${
-          flashing ? "text-nodoxx-text" : "text-nodoxx-muted"
+        className={`font-mono text-[13px] tabular-nums transition-colors duration-500 ${
+          flashing ? "text-kali-text" : "text-kali-dim"
         }`}
       >
         {formatCost(cost)}

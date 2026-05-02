@@ -10,12 +10,6 @@ interface Props {
   findings: Finding[];
 }
 
-// Per-pipeline microcopy. Generic "pipeline running..." wastes a slot
-// where we could be communicating *what* the audit is actually doing.
-// Concrete scope reduces uncertainty and shortens perceived wait time
-// (Maister: "filled time feels shorter than empty time"). Sub-second
-// visibility into the work also reinforces the audit's credibility — the
-// user can see we're touching real data, not just spinning a circle.
 const PIPELINE_COPY: Record<
   PipelineName,
   { running: string; clean: string; awaiting: string }
@@ -39,13 +33,13 @@ const PIPELINE_COPY: Record<
 
 export default function PipelineColumn({ pipeline, status, findings }: Props) {
   return (
-    <section className="flex min-h-[320px] flex-col border border-nodoxx-border bg-nodoxx-panel">
-      <header className="flex items-center justify-between gap-3 border-b border-nodoxx-border px-4 py-3">
+    <section className="flex min-h-[320px] flex-col border border-kali-border bg-kali-surface transition-colors hover:border-kali-text">
+      <header className="flex items-center justify-between gap-3 border-b border-kali-border px-4 py-3">
         <div className="flex items-center gap-2">
-          <h2 className="font-mono text-xs font-semibold uppercase tracking-[0.18em] text-nodoxx-text">
+          <h2 className="font-mono text-[13px] font-bold uppercase tracking-label text-kali-text">
             // {pipelineTitle(pipeline)}
           </h2>
-          <span className="border border-nodoxx-border bg-nodoxx-bg px-1.5 py-0.5 font-mono text-[10px] tabular-nums text-nodoxx-muted">
+          <span className="border border-kali-border bg-kali-bg px-1.5 py-0.5 font-mono text-[10px] tabular-nums text-kali-dim">
             {findings.length}
           </span>
         </div>
@@ -84,7 +78,7 @@ function EmptyState({
     label = (status.detail ?? "budget exceeded.").toLowerCase();
   }
   return (
-    <div className="flex h-full min-h-[180px] items-center justify-center border border-dashed border-nodoxx-border px-4 py-8 text-center font-mono text-[11px] leading-relaxed text-nodoxx-muted">
+    <div className="flex h-full min-h-[180px] items-center justify-center border border-dashed border-kali-border px-4 py-8 text-center font-mono text-[11px] leading-relaxed text-kali-dim">
       &gt; {label}
     </div>
   );

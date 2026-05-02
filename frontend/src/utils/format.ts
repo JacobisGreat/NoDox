@@ -30,25 +30,21 @@ export function formatConfidence(value: number): string {
   return clamped.toFixed(2);
 }
 
-// Severity is encoded as brightness on a single grayscale axis:
-//   bright white = high (alarming) | mid gray = medium | dim gray = low
-// Same convention applies to risk levels, confidence, and exposure score.
+// Severity is encoded as brightness on the strict 3-gray scale:
+//   #FFFFFF (high) | #A1A1A1 (medium) | #666666 (low)
 
 export function confidenceColor(value: number): string {
-  if (value > 0.7) return "#fafafa";
-  if (value > 0.4) return "#a3a3a3";
-  return "#525252";
+  if (value > 0.7) return "#FFFFFF";
+  if (value > 0.4) return "#A1A1A1";
+  return "#666666";
 }
 
 export function exposureColor(score: number): string {
-  if (score <= 30) return "#525252";
-  if (score <= 60) return "#a3a3a3";
-  return "#fafafa";
+  if (score <= 30) return "#666666";
+  if (score <= 60) return "#A1A1A1";
+  return "#FFFFFF";
 }
 
-// Categorical anchor for the exposure score. A bare number ("73 / 100") forces
-// the user to invent their own threshold; the label collapses that judgment
-// into a single pre-attentive token.
 export function exposureLabel(score: number): "LOW" | "MEDIUM" | "HIGH" | "CRITICAL" {
   if (score <= 30) return "LOW";
   if (score <= 60) return "MEDIUM";
@@ -56,8 +52,6 @@ export function exposureLabel(score: number): "LOW" | "MEDIUM" | "HIGH" | "CRITI
   return "CRITICAL";
 }
 
-// One-line interpretation paired with each band. Calibrates expectations and
-// takes the place of a tutorial.
 export function exposureBlurb(score: number): string {
   const band = exposureLabel(score);
   if (band === "LOW") return "Light public footprint. A stranger would learn very little.";
@@ -67,21 +61,33 @@ export function exposureBlurb(score: number): string {
 }
 
 export function riskBorderColor(level: RiskLevel): string {
-  if (level === "LOW") return "#525252";
-  if (level === "MEDIUM") return "#a3a3a3";
-  return "#fafafa";
+  if (level === "LOW") return "#666666";
+  if (level === "MEDIUM") return "#A1A1A1";
+  return "#FFFFFF";
 }
 
 export function riskTextClass(level: RiskLevel): string {
-  if (level === "LOW") return "text-risk-low";
-  if (level === "MEDIUM") return "text-risk-medium";
-  return "text-risk-high";
+  if (level === "LOW") return "text-kali-label";
+  if (level === "MEDIUM") return "text-kali-dim";
+  return "text-kali-text";
 }
 
+// Badge classes — text + border only. No bg overlays per strict palette.
+// Severity is reinforced by the ASCII prefix in FindingCard.
 export function riskBgClass(level: RiskLevel): string {
-  if (level === "LOW") return "bg-white/[0.04] text-risk-low border-risk-low/40";
-  if (level === "MEDIUM") return "bg-white/[0.06] text-risk-medium border-risk-medium/40";
-  return "bg-white/10 text-risk-high border-risk-high/60";
+  if (level === "LOW") return "text-kali-label border-kali-border";
+  if (level === "MEDIUM") return "text-kali-dim border-kali-border";
+  if (level === "HIGH") return "text-kali-text border-kali-border";
+  return "text-kali-text border-kali-text";
+}
+
+// Pre-attentive ASCII severity token. Replaces the old 2/3/4/5px left-border
+// encoding (1px-only rule).
+export function severityPrefix(level: RiskLevel): string {
+  if (level === "LOW") return "[!]";
+  if (level === "MEDIUM") return "[!!]";
+  if (level === "HIGH") return "[!!!]";
+  return "[!!!!]";
 }
 
 const URL_REGEX = /\b(https?:\/\/[^\s)]+)\b/g;

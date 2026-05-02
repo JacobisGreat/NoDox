@@ -29,25 +29,25 @@ export default function AuditHeader({
   streamDone,
 }: Props) {
   return (
-    <header className="sticky top-0 z-30 border-b border-nodoxx-border bg-nodoxx-bg/95 backdrop-blur-md">
-      <div className="mx-auto flex w-full max-w-7xl flex-col gap-3 px-4 py-3 sm:px-6 lg:flex-row lg:items-center lg:gap-6">
+    <header className="sticky top-0 z-30 border-b border-kali-border bg-kali-bg">
+      <div className="mx-auto flex w-full max-w-[1280px] flex-col gap-3 px-4 py-3 sm:px-6 lg:flex-row lg:items-center lg:gap-6">
         <div className="flex min-w-0 items-center gap-3">
           <a
             href="/"
-            className="select-none font-mono text-base font-bold tracking-[0.22em] text-nodoxx-text hover:text-nodoxx-muted"
+            className="select-none font-mono text-base font-bold tracking-label text-kali-text hover:text-kali-dim"
           >
             NODOXX
           </a>
-          <span className="hidden h-5 w-px bg-nodoxx-border sm:block" />
+          <span className="hidden h-5 w-px bg-kali-border sm:block" />
           {profile ? <ProfileBlock profile={profile} /> : <ProfileSkeleton />}
         </div>
 
         <div className="flex flex-wrap items-center gap-x-6 gap-y-2 lg:ml-auto">
           <div className="flex items-baseline gap-2">
-            <span className="font-mono text-xl font-bold tabular-nums text-nodoxx-text">
+            <span className="font-mono text-xl font-bold tabular-nums text-kali-text">
               {totalFindings}
             </span>
-            <span className="text-[10px] font-mono uppercase tracking-[0.2em] text-nodoxx-muted">
+            <span className="font-mono text-[10px] uppercase tracking-label text-kali-label">
               findings
             </span>
           </div>
@@ -56,14 +56,14 @@ export default function AuditHeader({
 
           <CostDisplay cost={cost} tick={costTick} />
 
-          <ConnectionDot connected={connected} streamDone={streamDone} />
+          <ConnectionToken connected={connected} streamDone={streamDone} />
         </div>
       </div>
 
-      <div className="mx-auto flex w-full max-w-7xl flex-wrap items-center gap-3 px-4 pb-3 sm:px-6">
+      <div className="mx-auto flex w-full max-w-[1280px] flex-wrap items-center gap-3 px-4 pb-3 sm:px-6">
         {PIPELINES.map((p) => (
           <div key={p} className="flex items-center gap-2">
-            <span className="font-mono text-[10px] uppercase tracking-[0.2em] text-nodoxx-muted">
+            <span className="font-mono text-[10px] uppercase tracking-label text-kali-label">
               [{pipelineTitle(p)}]
             </span>
             <StatusChip
@@ -84,16 +84,16 @@ function ProfileBlock({ profile }: { profile: Profile }) {
         src={profile.profile_pic_url}
         alt=""
         referrerPolicy="no-referrer"
-        className="h-10 w-10 flex-shrink-0 border border-nodoxx-border bg-nodoxx-panel object-cover grayscale"
+        className="h-10 w-10 flex-shrink-0 border border-kali-border bg-kali-surface object-cover grayscale"
         onError={(e) => {
           (e.currentTarget as HTMLImageElement).style.visibility = "hidden";
         }}
       />
       <div className="flex min-w-0 flex-col leading-tight">
-        <span className="truncate font-mono text-sm text-nodoxx-text">
+        <span className="truncate font-mono text-[13px] text-kali-text">
           @{profile.username}
         </span>
-        <span className="font-mono text-[11px] text-nodoxx-muted tabular-nums">
+        <span className="font-mono text-[11px] text-kali-dim tabular-nums">
           {formatCount(profile.followers)} followers
         </span>
       </div>
@@ -104,37 +104,40 @@ function ProfileBlock({ profile }: { profile: Profile }) {
 function ProfileSkeleton() {
   return (
     <div className="flex items-center gap-3">
-      <div className="h-10 w-10 animate-pulse bg-nodoxx-panel" />
+      <div className="h-10 w-10 animate-running-pulse bg-kali-surface" />
       <div className="flex flex-col gap-1">
-        <div className="h-3 w-24 animate-pulse bg-nodoxx-panel" />
-        <div className="h-2 w-16 animate-pulse bg-nodoxx-panel" />
+        <div className="h-3 w-24 animate-running-pulse bg-kali-surface" />
+        <div className="h-2 w-16 animate-running-pulse bg-kali-surface" />
       </div>
     </div>
   );
 }
 
-function ConnectionDot({
+function ConnectionToken({
   connected,
   streamDone,
 }: {
   connected: boolean;
   streamDone: boolean;
 }) {
-  let cls = "bg-nodoxx-dim";
+  let token = "[ ]";
   let label = "connecting";
+  let cls = "text-kali-label";
   if (streamDone) {
-    cls = "bg-nodoxx-text";
+    token = "[OK]";
     label = "done";
+    cls = "text-kali-text";
   } else if (connected) {
-    cls = "bg-nodoxx-text animate-running-pulse";
+    token = "[*]";
     label = "live";
+    cls = "text-kali-text animate-running-pulse";
   }
   return (
     <span
       title={label}
-      className="flex items-center gap-1.5 font-mono text-[10px] uppercase tracking-[0.18em] text-nodoxx-muted"
+      className="flex items-center gap-1.5 font-mono text-[10px] uppercase tracking-label text-kali-label"
     >
-      <span className={`h-2 w-2 ${cls}`} />
+      <span className={cls}>{token}</span>
       {label}
     </span>
   );

@@ -4,66 +4,52 @@ export default {
   theme: {
     extend: {
       colors: {
-        // Pure black-and-white hacker palette. No hue at all — severity
-        // and emphasis are encoded as brightness on a single axis. Tokens
-        // keep their old `nodoxx-*` names so component classes stay terse.
-        nodoxx: {
-          // Off-black instead of pure #000 — eliminates halation (bright text
-          // bleeding against true black) without sacrificing the terminal feel.
-          bg: "#0a0a0a",
-          panel: "#111111",
-          panel2: "#181818",
-          border: "#2a2a2a",
-          // Soft white instead of #fff — reduces glare during long scan
-          // sessions; still reads as "white" against the off-black ground.
-          accent: "#fafafa",
-          text: "#fafafa",
-          muted: "#737373",
-          dim: "#404040",
-        },
-        // Risk = brightness. The brighter the swatch, the higher the risk
-        // — same convention applies to confidence and exposure scores.
-        risk: {
-          low: "#525252",
-          medium: "#a3a3a3",
-          high: "#fafafa",
-          critical: "#fafafa",
+        // Strict 6-token grayscale. NO other grays. NO accents. NO hue.
+        // Severity is encoded by brightness on this single axis only.
+        kali: {
+          bg:      "#000000", // page background
+          surface: "#0A0A0A", // cards, raised panels, row hover
+          border:  "#1F1F1F", // default 1px borders
+          text:    "#FFFFFF", // primary text + active/selected bg invert
+          dim:     "#A1A1A1", // secondary text
+          label:   "#666666", // labels ONLY — never body copy
         },
       },
       fontFamily: {
-        sans: ['"Inter"', "ui-sans-serif", "system-ui", "-apple-system", "Segoe UI", "Roboto", "sans-serif"],
+        // Inter is the prose escape-hatch. Mono is the default everywhere else.
+        sans: ['"Inter"', "ui-sans-serif", "system-ui", "sans-serif"],
         mono: ['"JetBrains Mono"', "ui-monospace", "SFMono-Regular", "monospace"],
       },
+      letterSpacing: {
+        prose: "-0.01em", // Inter body
+        mono:  "0",       // JetBrains Mono default
+        label: "0.08em",  // uppercase labels
+      },
+      borderRadius: {
+        DEFAULT: "0",
+        none:    "0",
+        input:   "2px",   // ONLY allowed non-zero radius
+      },
+      boxShadow: {
+        none: "none",     // override Tailwind defaults — drop-shadows banned
+      },
       keyframes: {
-        cardIn: {
-          "0%": { opacity: "0", transform: "translateY(8px)" },
-          "100%": { opacity: "1", transform: "translateY(0)" },
+        // Only allowed motion: opacity-only animations.
+        caretBlink: {
+          "0%, 49%":   { opacity: "1" },
+          "50%, 100%": { opacity: "0" },
         },
         runningPulse: {
           "0%, 100%": { opacity: "1" },
-          "50%": { opacity: "0.4" },
-        },
-        costFlash: {
-          "0%": { color: "#ffffff" },
-          "100%": { color: "#737373" },
-        },
-        caretBlink: {
-          "0%, 49%": { opacity: "1" },
-          "50%, 100%": { opacity: "0" },
+          "50%":      { opacity: "0.4" },
         },
       },
       animation: {
-        "card-in": "cardIn 200ms ease-out forwards",
+        "caret-blink":   "caretBlink 1s steps(1, end) infinite",
         "running-pulse": "runningPulse 1.4s ease-in-out infinite",
-        "cost-flash": "costFlash 500ms ease-out forwards",
-        "caret-blink": "caretBlink 1s steps(1, end) infinite",
       },
-      boxShadow: {
-        // White inset hairline + faint outer glow. No color.
-        neon: "0 0 0 1px rgba(255, 255, 255, 0.18), 0 0 0 0 rgba(0,0,0,0)",
-      },
-      borderRadius: {
-        DEFAULT: "6px",
+      transitionDuration: {
+        DEFAULT: "120ms",
       },
     },
   },
