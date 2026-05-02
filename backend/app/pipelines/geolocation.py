@@ -84,11 +84,28 @@ _VLM_SYSTEM_PROMPT = (
 )
 
 _AGGREGATOR_SYSTEM_PROMPT = (
-    "You are a geolocation intelligence aggregator. Given these location "
-    "signals from multiple social media posts, identify the most likely "
-    "regions/cities the user frequents. Cross-reference signals. Respond "
-    "with JSON: {\"clusters\": [{\"region\": str, \"confidence\": float, "
-    "\"evidence\": [str], \"risk_level\": \"LOW\"|\"MEDIUM\"|\"HIGH\"|\"CRITICAL\"}]}"
+    "You are a geolocation intelligence aggregator. You will receive two "
+    "groups of signals harvested from a target's recent posts:\n\n"
+    "  IMAGE_DERIVED — primary evidence. EXIF GPS, GeoCLIP image-to-coord "
+    "predictions, OCR text from photos, visual landmark recognitions, "
+    "object detections. These come from analyzing the image content itself.\n"
+    "  TAG_BASED — corroboration only. Instagram location tags the user "
+    "(or someone) attached to the post. Tags are easy to spoof or apply to "
+    "unrelated posts; they MUST NOT be the sole basis for a high-confidence "
+    "cluster.\n\n"
+    "Decision rules:\n"
+    "1. Base every cluster's region on IMAGE_DERIVED evidence first.\n"
+    "2. Use TAG_BASED signals only to corroborate, refine, or sanity-check "
+    "an already image-supported region.\n"
+    "3. If a cluster is supported only by TAG_BASED signals (no image "
+    "evidence at all), label it with risk_level LOW and confidence ≤ 0.45 — "
+    "it is a tag-only fallback estimate, not a confirmed location.\n"
+    "4. If image evidence exists but contradicts the tags, prefer the image "
+    "evidence and flag the inconsistency in the evidence list.\n\n"
+    "Respond with JSON: {\"clusters\": [{\"region\": str, "
+    "\"confidence\": float, \"evidence\": [str], "
+    "\"risk_level\": \"LOW\"|\"MEDIUM\"|\"HIGH\"|\"CRITICAL\", "
+    "\"primary_source\": \"image\"|\"tag_fallback\"}]}"
 )
 
 
@@ -369,6 +386,7 @@ async def _process_location_tag(session: SessionState, post: dict) -> dict | Non
         "location_name": location_name,
         "location_id": post.get("location_id"),
         "shortcode": shortcode,
+        "signal_category": _CAT_TAG,
     }
     hit = await _geocode_first(location_name)
     if hit is not None:
@@ -396,6 +414,7 @@ async def _process_location_tag(session: SessionState, post: dict) -> dict | Non
     await _emit_finding(session, finding)
     signal: dict[str, Any] = {
         "type": "instagram_location_tag",
+        "category": _CAT_TAG,
         "description": location_name,
         "location_hint": location_name,
         "confidence": 0.85,
@@ -474,6 +493,7 @@ async def _process_vlm(
             signals.append(
                 {
                     "type": str(sig.get("type", "") or "vlm_signal"),
+                    "category": _CAT_IMAGE_SECONDARY,
                     "description": str(sig.get("description", "") or ""),
                     "location_hint": str(sig.get("location_hint", "") or ""),
                     "confidence": max(0.0, min(1.0, conf)),
@@ -490,6 +510,7 @@ async def _process_vlm(
                 "shortcode": shortcode,
                 "signal_type": sig["type"],
                 "location_hint": sig["location_hint"],
+                "signal_category": _CAT_IMAGE_SECONDARY,
             }
             hit = await _geocode_first(
                 sig["location_hint"], sig.get("best_guess_region")
@@ -544,6 +565,7 @@ async def _process_geoclip(
         relevant.append(
             {
                 "type": "geoclip_prediction",
+                "category": _CAT_IMAGE_PRIMARY,
                 "description": (
                     f"GeoCLIP top prediction at "
                     f"({pred['lat']:.4f}, {pred['lon']:.4f})"
@@ -575,6 +597,7 @@ async def _process_geoclip(
                 "lon": pred["lon"],
                 "shortcode": shortcode,
                 "model_confidence": conf,
+                "signal_category": _CAT_IMAGE_PRIMARY,
             }
             if place is not None:
                 metadata.update(
@@ -654,6 +677,7 @@ async def _process_media_analyzer(
             "geocoded_via": hit.method,
             "geocoded_match": hit.name,
             "geocode_confidence": hit.confidence,
+            "signal_category": _CAT_IMAGE_SECONDARY,
         }
         if hit.country:
             finding_metadata["country"] = hit.country
@@ -683,6 +707,7 @@ async def _process_media_analyzer(
         signals.append(
             {
                 "type": "media_analyzer_ocr",
+                "category": _CAT_IMAGE_SECONDARY,
                 "description": f"OCR matched {hit.name}",
                 "location_hint": f"{hit.name}, {hit.country}".strip(", "),
                 "confidence": min(0.85, 0.5 * line.confidence + 0.5 * hit.confidence),
@@ -701,6 +726,7 @@ async def _process_media_analyzer(
         signals.append(
             {
                 "type": "media_analyzer_object",
+                "category": _CAT_IMAGE_SECONDARY,
                 "description": f"Detected {obj.label} in image",
                 "location_hint": obj.label,
                 "confidence": min(0.6, obj.confidence),
@@ -719,6 +745,7 @@ async def _process_media_analyzer(
         signals.append(
             {
                 "type": "media_analyzer_ocr_raw",
+                "category": _CAT_IMAGE_SECONDARY,
                 "description": text[:120],
                 "location_hint": text[:120],
                 "confidence": min(0.5, line.confidence),
@@ -766,6 +793,7 @@ async def _process_post(
             "lat": lat,
             "lon": lon,
             "shortcode": shortcode,
+            "signal_category": _CAT_IMAGE_PRIMARY,
         }
         if place is not None:
             finding_metadata.update(
@@ -789,6 +817,7 @@ async def _process_post(
         signals.append(
             {
                 "type": "exif_gps",
+                "category": _CAT_IMAGE_PRIMARY,
                 "description": "EXIF GPS coordinates",
                 "location_hint": place_label or f"{lat:.4f}, {lon:.4f}",
                 "confidence": 0.95,
@@ -831,8 +860,19 @@ async def _process_post(
 
 
 async def _run_aggregation(
-    session: SessionState, all_signals: list[dict]
+    session: SessionState,
+    image_signals: list[dict],
+    tag_signals: list[dict],
+    *,
+    primary_source: str,
 ) -> None:
+    """Aggregate partitioned signals into region clusters.
+
+    ``primary_source`` is ``"image"`` when at least one image-derived
+    signal exists, or ``"tag_fallback"`` when only Instagram tags survived
+    image scanning. The prompt makes the distinction explicit so Sonnet
+    weights image-derived evidence higher than tags.
+    """
     settings = get_settings()
     cost_tracker = session.data.get("cost_tracker")
     anthropic = session.data.get("anthropic")
@@ -843,12 +883,25 @@ async def _run_aggregation(
     ):
         return
 
-    user_prompt = (
-        "Signals collected from the target's recent Instagram posts. Each "
-        "signal links back to a single shortcode so you can correlate. "
-        "Identify the most likely cities/regions and rank by confidence.\n\n"
-        + json.dumps(all_signals, indent=2, ensure_ascii=False)
-    )
+    if primary_source == "tag_fallback":
+        user_prompt = (
+            "IMAGE_DERIVED signals: NONE — image-based scanners (EXIF, "
+            "GeoCLIP, OCR, VLM, object detection) produced no usable "
+            "location evidence for this target's posts.\n\n"
+            "TAG_BASED signals (fallback only — flag clusters as "
+            "tag_fallback with confidence ≤ 0.45):\n"
+            + json.dumps(tag_signals, indent=2, ensure_ascii=False)
+        )
+    else:
+        user_prompt = (
+            "IMAGE_DERIVED signals (primary evidence — base your cluster "
+            "decisions on these):\n"
+            + json.dumps(image_signals, indent=2, ensure_ascii=False)
+            + "\n\nTAG_BASED signals (corroboration only — use to verify "
+            "or refine the image-derived clusters; ignore if they conflict "
+            "without image support):\n"
+            + json.dumps(tag_signals, indent=2, ensure_ascii=False)
+        )
 
     try:
         text, usage = await anthropic.call_text(
@@ -896,10 +949,25 @@ async def _run_aggregation(
             f"Cluster confidence: {confidence:.2f}",
         ] + [f"Evidence: {line}" for line in evidence_lines]
 
+        cluster_primary = str(
+            cluster.get("primary_source", primary_source) or primary_source
+        ).strip().lower()
+        if cluster_primary not in {"image", "tag_fallback"}:
+            cluster_primary = primary_source
+
         metadata: dict[str, Any] = {
             "region": region,
             "evidence": evidence_lines,
             "cluster_confidence": confidence,
+            "primary_source": cluster_primary,
+            # Aggregator findings inherit the strongest contributing
+            # category. Tag-fallback clusters carry the tag category so
+            # the frontend can de-emphasize them on the map.
+            "signal_category": (
+                _CAT_IMAGE_PRIMARY
+                if cluster_primary == "image"
+                else _CAT_TAG
+            ),
         }
         # Geocode the region (and fall back to scanning evidence lines) so the
         # cluster lands on the map.
@@ -909,6 +977,11 @@ async def _run_aggregation(
             evidence_chain.append(
                 f"Geocoded to: {hit.name}, {hit.country} "
                 f"({hit.lat:.4f}, {hit.lon:.4f})"
+            )
+        if cluster_primary == "tag_fallback":
+            evidence_chain.append(
+                "Source: Instagram location tags only (image-based "
+                "scanning produced no signal for this region)."
             )
 
         finding = Finding(

@@ -116,7 +116,7 @@ const TILE_ATTR =
 // flyTo natively interpolates pan + zoom along a smooth zoom-out-arc-
 // zoom-in curve; chaining multiple flyTos breaks that arc into disjoint
 // segments and feels janky.
-const ZOOM_TARGET = 13; // city
+const ZOOM_TARGET = 10; // metro/city overview — not street level
 const ZOOM_DURATION_S = 1.2;
 // Lower easeLinearity = more aggressive bezier; 1.0 = linear. 0.1 punches in.
 const ZOOM_EASE = 0.1;
