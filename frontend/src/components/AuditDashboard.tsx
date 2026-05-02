@@ -30,7 +30,8 @@ export default function AuditDashboard({ sessionId }: Props) {
 
       <main className="mx-auto w-full max-w-7xl px-4 py-6 sm:px-6">
         {(audit.startError || audit.streamError) && (
-          <div className="mb-6 rounded-lg border border-risk-high/40 bg-risk-high/10 px-4 py-3 text-sm text-risk-high">
+          <div className="mb-6 border border-nodoxx-text/40 bg-white/[0.04] px-4 py-3 font-mono text-sm text-nodoxx-text">
+            <span className="text-nodoxx-muted">err: </span>
             {audit.startError ?? audit.streamError}
           </div>
         )}
@@ -38,14 +39,14 @@ export default function AuditDashboard({ sessionId }: Props) {
         {audit.aggregator ? (
           <ExposureScore aggregator={audit.aggregator} />
         ) : (
-          <section className="rounded-xl border border-nodoxx-border/30 bg-nodoxx-panel/50 p-6">
+          <section className="border border-nodoxx-border bg-nodoxx-panel p-6">
             <div className="flex items-center gap-3">
               <span
                 aria-hidden="true"
-                className="inline-block h-4 w-4 animate-spin rounded-full border-2 border-nodoxx-muted/30 border-t-nodoxx-accent"
+                className="inline-block h-3 w-3 animate-spin rounded-full border-2 border-nodoxx-dim border-t-nodoxx-text"
               />
-              <span className="text-sm text-nodoxx-muted">
-                Pipelines running. Findings stream in below.
+              <span className="font-mono text-xs uppercase tracking-[0.18em] text-nodoxx-muted">
+                pipelines running. findings stream below.
               </span>
             </div>
           </section>

@@ -12,13 +12,13 @@ interface Props {
 
 export default function PipelineColumn({ pipeline, status, findings }: Props) {
   return (
-    <section className="flex min-h-[320px] flex-col rounded-xl border border-nodoxx-border/30 bg-nodoxx-panel/50">
-      <header className="flex items-center justify-between gap-3 border-b border-nodoxx-border/30 px-4 py-3">
+    <section className="flex min-h-[320px] flex-col border border-nodoxx-border bg-nodoxx-panel">
+      <header className="flex items-center justify-between gap-3 border-b border-nodoxx-border px-4 py-3">
         <div className="flex items-center gap-2">
-          <h2 className="text-sm font-semibold tracking-wide text-nodoxx-text">
-            {pipelineTitle(pipeline)}
+          <h2 className="font-mono text-xs font-semibold uppercase tracking-[0.18em] text-nodoxx-text">
+            // {pipelineTitle(pipeline)}
           </h2>
-          <span className="rounded-full border border-nodoxx-border/40 bg-nodoxx-bg px-2 py-0.5 font-mono text-[11px] tabular-nums text-nodoxx-muted">
+          <span className="border border-nodoxx-border bg-nodoxx-bg px-1.5 py-0.5 font-mono text-[10px] tabular-nums text-nodoxx-muted">
             {findings.length}
           </span>
         </div>
@@ -39,19 +39,19 @@ export default function PipelineColumn({ pipeline, status, findings }: Props) {
 }
 
 function EmptyState({ status }: { status: PipelineStatusState }) {
-  let label = "Awaiting findings...";
+  let label = "awaiting findings...";
   if (status.status === "running") {
-    label = status.detail ?? "Pipeline running...";
+    label = (status.detail ?? "pipeline running...").toLowerCase();
   } else if (status.status === "complete") {
-    label = "No findings surfaced.";
+    label = "no findings surfaced.";
   } else if (status.status === "error") {
-    label = status.detail ?? "Pipeline error.";
+    label = (status.detail ?? "pipeline error.").toLowerCase();
   } else if (status.status === "budget_exceeded") {
-    label = status.detail ?? "Budget exceeded.";
+    label = (status.detail ?? "budget exceeded.").toLowerCase();
   }
   return (
-    <div className="flex h-full min-h-[180px] items-center justify-center rounded-lg border border-dashed border-nodoxx-border/40 px-4 py-8 text-center text-xs text-nodoxx-muted">
-      {label}
+    <div className="flex h-full min-h-[180px] items-center justify-center border border-dashed border-nodoxx-border px-4 py-8 text-center font-mono text-[11px] text-nodoxx-muted">
+      &gt; {label}
     </div>
   );
 }

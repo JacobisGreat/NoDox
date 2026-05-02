@@ -65,6 +65,14 @@ class ProbeHit:
     url: str
     category: str
     risk_level: str  # "MEDIUM" | "HIGH"
+    # How the match was detected — drives confidence in the caller. One of:
+    #   "two_sided"          WMN positive+negative markers both passed
+    #   "status_and_message" Sherlock with both 200-class + error-string
+    #                        absence; strong but no positive marker
+    #   "status_only"        Sherlock status_code path only
+    #   "message_only"       Sherlock message-only entry, username
+    #                        echoed in body (weakest reliable signal)
+    detection_mode: str = "status_only"
 
 
 def _select_platforms() -> list[dict[str, Any]]:
@@ -162,16 +170,19 @@ async def _check_one(
         m_match = (resp.status_code == m_code) and (m_string in body_for_match)
         if not e_match or m_match:
             return None
+        detection_mode = "two_sided"
     else:
         # Sherlock-style fallback (kept for catalogs lacking WMN markers):
         error_types: list[str] = platform.get("error_types", ["status_code"])
         error_messages: list[str] = platform.get("error_messages", [])
         error_codes: list[int] = platform.get("error_codes", [])
-        if "status_code" in error_types:
+        has_status = "status_code" in error_types
+        has_message = "message" in error_types and bool(error_messages)
+        if has_status:
             codes = error_codes or [404]
             if resp.status_code in codes:
                 return None
-        if "message" in error_types and error_messages:
+        if has_message:
             snippet = body_for_match.lower()
             for needle in error_messages:
                 if needle and needle.lower() in snippet:
@@ -180,12 +191,24 @@ async def _check_one(
             # avoid concluding "user exists" purely from absence-of-error.
             # A 200 response whose body never mentions the username is
             # almost always a homepage redirect or generic landing page.
-            if "status_code" not in error_types:
+            if not has_status:
                 if username.lower() not in body_for_match.lower():
                     return None
+        if has_status and has_message:
+            detection_mode = "status_and_message"
+        elif has_status:
+            detection_mode = "status_only"
+        else:
+            detection_mode = "message_only"
 
     risk = "HIGH" if _is_high_risk(name, category) else "MEDIUM"
-    return ProbeHit(site=name, url=url, category=category, risk_level=risk)
+    return ProbeHit(
+        site=name,
+        url=url,
+        category=category,
+        risk_level=risk,
+        detection_mode=detection_mode,
+    )
 
 
 async def probe(

@@ -183,39 +183,6 @@ interface RawSignal {
   category: SignalCategory;
 }
 
-interface ScanSummary {
-  imagesScanned: number;
-  primarySource: "image" | "tag_fallback" | "none" | null;
-  imageSignalTotal: number;
-  channelCounts: Record<string, number>;
-}
-
-function readScanSummary(findings: Finding[]): ScanSummary | null {
-  for (let i = findings.length - 1; i >= 0; i--) {
-    const f = findings[i];
-    if (f.source !== "geolocation_scan_summary") continue;
-    const md = (f.metadata ?? {}) as Record<string, unknown>;
-    const counts =
-      (typeof md.channel_counts === "object" && md.channel_counts !== null
-        ? (md.channel_counts as Record<string, number>)
-        : {}) ?? {};
-    return {
-      imagesScanned:
-        typeof md.images_scanned === "number" ? md.images_scanned : 0,
-      primarySource:
-        md.primary_source === "image" ||
-        md.primary_source === "tag_fallback" ||
-        md.primary_source === "none"
-          ? md.primary_source
-          : null,
-      imageSignalTotal:
-        typeof md.image_signal_total === "number" ? md.image_signal_total : 0,
-      channelCounts: counts,
-    };
-  }
-  return null;
-}
-
 /**
  * Collect candidate signals from findings. Returns coords-direct entries
  * (EXIF GPS, GeoCLIP) AS-IS, and label-only entries (Instagram location
@@ -225,9 +192,6 @@ function readScanSummary(findings: Finding[]): ScanSummary | null {
 function collectSignals(findings: Finding[]): RawSignal[] {
   const out: RawSignal[] = [];
   for (const f of findings) {
-    // Skip the scan-summary finding — it's a status row, not a map signal.
-    if (f.source === "geolocation_scan_summary") continue;
-
     const md = f.metadata as Record<string, unknown> | undefined;
     if (!md) continue;
 
@@ -449,16 +413,6 @@ export default function GeoMap({ findings }: Props) {
     return out;
   }, [signals, resolvedLabels]);
 
-  const scanSummary = useMemo(() => readScanSummary(findings), [findings]);
-  const imagePointCount = useMemo(
-    () => points.filter((p) => p.category !== "tag").length,
-    [points],
-  );
-  const tagPointCount = points.length - imagePointCount;
-  const isTagFallback =
-    (scanSummary?.primarySource === "tag_fallback") ||
-    (imagePointCount === 0 && tagPointCount > 0);
-
   const centroid = useMemo(() => computeCentroid(points), [points]);
   const [zoomingDone, setZoomingDone] = useState(false);
 
@@ -482,53 +436,47 @@ export default function GeoMap({ findings }: Props) {
 
   if (!centroid || points.length === 0) {
     return (
-      <section className="rounded-xl border border-nodoxx-border/30 bg-nodoxx-panel/50 p-6">
+      <section className="border border-nodoxx-border bg-nodoxx-panel p-6">
         <header className="mb-3 flex items-center gap-2">
-          <h2 className="text-sm font-semibold tracking-wide text-nodoxx-text">
-            Estimated Location
+          <h2 className="font-mono text-xs font-semibold uppercase tracking-[0.18em] text-nodoxx-text">
+            // estimated location
           </h2>
-          <span className="rounded-full border border-nodoxx-border/40 bg-nodoxx-bg px-2 py-0.5 font-mono text-[11px] tabular-nums text-nodoxx-muted">
+          <span className="border border-nodoxx-border bg-nodoxx-bg px-1.5 py-0.5 font-mono text-[10px] tabular-nums text-nodoxx-muted">
             {points.length}
           </span>
         </header>
-        {scanSummary && (
-          <div className="mb-3 rounded-md border border-nodoxx-border/40 bg-nodoxx-bg/60 px-3 py-2 font-mono text-[11px] leading-relaxed text-nodoxx-muted">
-            Scanned {scanSummary.imagesScanned} image
-            {scanSummary.imagesScanned === 1 ? "" : "s"} via EXIF · GeoCLIP ·
-            VLM · OCR · object detection — no usable location signal yet.
-          </div>
-        )}
-        <div className="flex h-40 items-center justify-center rounded-lg border border-dashed border-nodoxx-border/40 text-xs text-nodoxx-muted">
+        <div className="flex h-40 items-center justify-center border border-dashed border-nodoxx-border font-mono text-[11px] text-nodoxx-muted">
+          &gt;{" "}
           {pendingGeocodes > 0
-            ? `Geocoding ${pendingGeocodes} location ${
+            ? `geocoding ${pendingGeocodes} location ${
                 pendingGeocodes === 1 ? "tag" : "tags"
               }...`
-            : "Awaiting geolocation evidence with coordinates..."}
+            : "awaiting geolocation evidence with coordinates..."}
         </div>
       </section>
     );
   }
 
   return (
-    <section className="rounded-xl border border-nodoxx-border/30 bg-nodoxx-panel/50 p-4 sm:p-6">
+    <section className="border border-nodoxx-border bg-nodoxx-panel p-4 sm:p-6">
       <header className="mb-3 flex flex-wrap items-center justify-between gap-3">
         <div className="flex items-center gap-2">
-          <h2 className="text-sm font-semibold tracking-wide text-nodoxx-text">
-            Estimated Location
+          <h2 className="font-mono text-xs font-semibold uppercase tracking-[0.18em] text-nodoxx-text">
+            // estimated location
           </h2>
-          <span className="rounded-full border border-nodoxx-border/40 bg-nodoxx-bg px-2 py-0.5 font-mono text-[11px] tabular-nums text-nodoxx-muted">
+          <span className="border border-nodoxx-border bg-nodoxx-bg px-1.5 py-0.5 font-mono text-[10px] tabular-nums text-nodoxx-muted">
             {points.length} {points.length === 1 ? "signal" : "signals"}
           </span>
         </div>
-        <div className="flex items-center gap-3 font-mono text-[11px] uppercase tracking-wider text-nodoxx-muted">
+        <div className="flex items-center gap-3 font-mono text-[10px] uppercase tracking-[0.18em] text-nodoxx-muted">
           <span>
-            <span className="text-nodoxx-muted/70">centroid </span>
+            <span>centroid </span>
             <span className="text-nodoxx-text">
               {centroid.lat.toFixed(2)}, {centroid.lon.toFixed(2)}
             </span>
           </span>
           <span>
-            <span className="text-nodoxx-muted/70">radius </span>
+            <span>radius </span>
             <span className="text-nodoxx-text">
               {formatKm(centroid.radiusKm)}
             </span>
@@ -537,60 +485,26 @@ export default function GeoMap({ findings }: Props) {
       </header>
 
       {centroid.bestLabel && (
-        <p className="mb-3 font-mono text-xs text-nodoxx-accent/90">
-          Best match:{" "}
+        <p className="mb-3 font-mono text-xs text-nodoxx-muted">
+          best match:{" "}
           <span className="text-nodoxx-text">{centroid.bestLabel}</span>
         </p>
       )}
 
-      {scanSummary && (
-        <div
-          className={`mb-3 rounded-md border px-3 py-2 font-mono text-[11px] leading-relaxed ${
-            isTagFallback
-              ? "border-risk-medium/40 bg-risk-medium/10 text-risk-medium"
-              : "border-nodoxx-border/40 bg-nodoxx-bg/60 text-nodoxx-muted"
-          }`}
-        >
-          <div className="text-nodoxx-text/90">
-            Scanned {scanSummary.imagesScanned} image
-            {scanSummary.imagesScanned === 1 ? "" : "s"} via EXIF · GeoCLIP ·
-            VLM · OCR · object detection
-            {" — "}
-            <span className="font-semibold">
-              {scanSummary.imageSignalTotal}
-            </span>{" "}
-            image-derived signal
-            {scanSummary.imageSignalTotal === 1 ? "" : "s"}
-          </div>
-          {isTagFallback && (
-            <div className="mt-1">
-              No usable image-based location signal — falling back to Instagram
-              location tags as the only estimate. Treat the marker as
-              approximate.
-            </div>
-          )}
-          {!isTagFallback && tagPointCount > 0 && (
-            <div className="mt-1 text-nodoxx-muted/80">
-              + {tagPointCount} Instagram tag{tagPointCount === 1 ? "" : "s"}{" "}
-              corroborating the image-based estimate.
-            </div>
-          )}
-        </div>
-      )}
-
-      <div className="relative overflow-hidden rounded-lg border border-nodoxx-border/30 bg-nodoxx-bg">
+      <div className="relative overflow-hidden border border-nodoxx-border bg-nodoxx-bg">
         <MapContainer
           center={[20, 0]}
           zoom={2}
           minZoom={2}
           maxZoom={18}
-          worldCopyJump
+          maxBounds={[[-85, -180], [85, 180]]}
+          maxBoundsViscosity={1.0}
           zoomControl={false}
           attributionControl={false}
           className="h-[420px] w-full"
-          style={{ background: "#0a0f1e" }}
+          style={{ background: "#0a0a0a" }}
         >
-          <TileLayer url={TILE_URL} attribution={TILE_ATTR} />
+          <TileLayer url={TILE_URL} attribution={TILE_ATTR} noWrap />
 
           <HyperzoomController centroid={centroid} />
 
@@ -599,12 +513,12 @@ export default function GeoMap({ findings }: Props) {
             center={[centroid.lat, centroid.lon]}
             radius={centroid.radiusKm * 1000}
             pathOptions={{
-              color: "#00d4ff",
+              color: "#fafafa",
               weight: 1.4,
-              opacity: 0.7,
+              opacity: 0.75,
               dashArray: "5 4",
-              fillColor: "#00d4ff",
-              fillOpacity: 0.08,
+              fillColor: "#fafafa",
+              fillOpacity: 0.06,
             }}
           />
 
@@ -615,20 +529,19 @@ export default function GeoMap({ findings }: Props) {
               center={[centroid.lat, centroid.lon]}
               radius={10}
               pathOptions={{
-                color: "#00d4ff",
+                color: "#fafafa",
                 weight: 2,
-                fillColor: "#00d4ff",
-                fillOpacity: 0.4,
+                fillColor: "#fafafa",
+                fillOpacity: 0.35,
                 className: "nodoxx-geo-pulse",
               }}
             />
           )}
 
-          {/* Per-evidence markers. Image-derived points: solid cyan dot
-              (the authoritative evidence). Tag-derived points: hollow
-              cyan ring (visually subordinate, since tags only corroborate
-              image-based inference). Drawn translucent during the flyTo
-              so the eye stays on the centroid. */}
+          {/* Per-evidence markers. Image-derived points: solid white dot
+              (authoritative evidence). Tag-derived points: hollow dashed
+              ring (subordinate corroboration). Drawn translucent during
+              the flyTo so the eye stays on the centroid. */}
           {points.map((p, i) => {
             const isTag = p.category === "tag";
             return (
@@ -639,17 +552,17 @@ export default function GeoMap({ findings }: Props) {
                 pathOptions={
                   isTag
                     ? {
-                        color: "#00d4ff",
+                        color: "#fafafa",
                         weight: 1.4,
                         opacity: zoomingDone ? 0.85 : 0.35,
-                        fillColor: "#00d4ff",
-                        fillOpacity: zoomingDone ? 0.12 : 0.05,
+                        fillColor: "#fafafa",
+                        fillOpacity: zoomingDone ? 0.1 : 0.04,
                         dashArray: "2 2",
                       }
                     : {
-                        color: "#0a0f1e",
+                        color: "#0a0a0a",
                         weight: 1,
-                        fillColor: "#00d4ff",
+                        fillColor: "#fafafa",
                         fillOpacity: zoomingDone ? 0.95 : 0.4,
                       }
                 }
@@ -658,8 +571,8 @@ export default function GeoMap({ findings }: Props) {
           })}
         </MapContainer>
 
-        <div className="pointer-events-none absolute bottom-2 left-2 z-[400] rounded bg-nodoxx-bg/80 px-2 py-1 font-mono text-[10px] uppercase tracking-wider text-nodoxx-muted backdrop-blur">
-          leaflet · carto dark · weighted by confidence
+        <div className="pointer-events-none absolute bottom-2 left-2 z-[400] bg-nodoxx-bg/80 px-2 py-1 font-mono text-[10px] uppercase tracking-[0.18em] text-nodoxx-muted backdrop-blur">
+          leaflet &middot; carto &middot; weighted by confidence
         </div>
       </div>
 
@@ -681,9 +594,9 @@ export default function GeoMap({ findings }: Props) {
             return (
               <li
                 key={`leg-${i}`}
-                className="flex items-center justify-between gap-3 rounded-md border border-nodoxx-border/30 bg-nodoxx-bg/60 px-3 py-2 text-xs"
+                className="flex min-w-0 items-center justify-between gap-3 rounded-md border border-nodoxx-border/30 bg-nodoxx-bg/60 px-3 py-2 text-xs"
               >
-                <span className="flex items-center gap-2 truncate text-nodoxx-text/90">
+                <span className="flex min-w-0 items-center gap-2 truncate text-nodoxx-text/90">
                   <span
                     aria-hidden="true"
                     className={`inline-block h-2 w-2 shrink-0 rounded-full ${
@@ -699,7 +612,7 @@ export default function GeoMap({ findings }: Props) {
                     </span>
                   )}
                 </span>
-                <span className="shrink-0 font-mono text-nodoxx-muted">
+                <span className="shrink-0 truncate font-mono text-nodoxx-muted">
                   {p.label ?? `${p.lat.toFixed(2)}, ${p.lon.toFixed(2)}`}
                 </span>
               </li>

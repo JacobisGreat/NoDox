@@ -30,22 +30,46 @@ export function formatConfidence(value: number): string {
   return clamped.toFixed(2);
 }
 
+// Severity is encoded as brightness on a single grayscale axis:
+//   bright white = high (alarming) | mid gray = medium | dim gray = low
+// Same convention applies to risk levels, confidence, and exposure score.
+
 export function confidenceColor(value: number): string {
-  if (value > 0.7) return "#22c55e";
-  if (value > 0.4) return "#f97316";
-  return "#ef4444";
+  if (value > 0.7) return "#fafafa";
+  if (value > 0.4) return "#a3a3a3";
+  return "#525252";
 }
 
 export function exposureColor(score: number): string {
-  if (score <= 30) return "#22c55e";
-  if (score <= 60) return "#f97316";
-  return "#ef4444";
+  if (score <= 30) return "#525252";
+  if (score <= 60) return "#a3a3a3";
+  return "#fafafa";
+}
+
+// Categorical anchor for the exposure score. A bare number ("73 / 100") forces
+// the user to invent their own threshold; the label collapses that judgment
+// into a single pre-attentive token.
+export function exposureLabel(score: number): "LOW" | "MEDIUM" | "HIGH" | "CRITICAL" {
+  if (score <= 30) return "LOW";
+  if (score <= 60) return "MEDIUM";
+  if (score <= 85) return "HIGH";
+  return "CRITICAL";
+}
+
+// One-line interpretation paired with each band. Calibrates expectations and
+// takes the place of a tutorial.
+export function exposureBlurb(score: number): string {
+  const band = exposureLabel(score);
+  if (band === "LOW") return "Light public footprint. A stranger would learn very little.";
+  if (band === "MEDIUM") return "Moderate footprint. Some signals worth tightening.";
+  if (band === "HIGH") return "Significant findings. A motivated stranger could pivot from here.";
+  return "Severe footprint. Treat the remediation list as priority work.";
 }
 
 export function riskBorderColor(level: RiskLevel): string {
-  if (level === "LOW") return "#22c55e";
-  if (level === "MEDIUM") return "#f97316";
-  return "#ef4444";
+  if (level === "LOW") return "#525252";
+  if (level === "MEDIUM") return "#a3a3a3";
+  return "#fafafa";
 }
 
 export function riskTextClass(level: RiskLevel): string {
@@ -55,9 +79,9 @@ export function riskTextClass(level: RiskLevel): string {
 }
 
 export function riskBgClass(level: RiskLevel): string {
-  if (level === "LOW") return "bg-risk-low/15 text-risk-low border-risk-low/40";
-  if (level === "MEDIUM") return "bg-risk-medium/15 text-risk-medium border-risk-medium/40";
-  return "bg-risk-high/15 text-risk-high border-risk-high/40";
+  if (level === "LOW") return "bg-white/[0.04] text-risk-low border-risk-low/40";
+  if (level === "MEDIUM") return "bg-white/[0.06] text-risk-medium border-risk-medium/40";
+  return "bg-white/10 text-risk-high border-risk-high/60";
 }
 
 const URL_REGEX = /\b(https?:\/\/[^\s)]+)\b/g;

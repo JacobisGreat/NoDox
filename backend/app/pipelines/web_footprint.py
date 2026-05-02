@@ -26,10 +26,14 @@ from app.schemas.findings import Finding
 from app.services import account_probe as _account_probe
 from app.services import breach_check as _breach_check
 from app.services import dork_catalog as _dork_catalog
+from app.services import email_permutator as _email_permutator
+from app.services import emailrep as _emailrep
+from app.services import github_lookup as _github_lookup
 from app.services import gravatar as _gravatar
 from app.services import intelbase as _intelbase
 from app.services import searchcode as _searchcode
 from app.services import spiderfoot_catalog as _sf_catalog
+from app.services import wayback as _wayback
 from app.services.serper import SerperClient, SerperError
 from app.services.trafilatura_fetch import TrafilaturaFetcher
 from app.session_store import SessionState
@@ -422,21 +426,40 @@ async def _run_account_probe(session: SessionState, username: str, http) -> None
         return
 
     findings_log: list[dict] = session.data.setdefault("findings", [])
+    # Per-mode confidence: stronger evidence (two-sided WMN match) reads as
+    # high confidence; weakest reliable signal (Sherlock message-only) reads
+    # as moderate so a row of probe hits doesn't all show the same number.
+    _MODE_CONFIDENCE = {
+        "two_sided": 0.92,
+        "status_and_message": 0.78,
+        "status_only": 0.62,
+        "message_only": 0.48,
+    }
+    _MODE_LABEL = {
+        "two_sided": "WMN two-sided match (positive + negative markers)",
+        "status_and_message": "Sherlock status + error-message check",
+        "status_only": "Sherlock status_code check only",
+        "message_only": "Sherlock message check + username echoed in body",
+    }
     for hit in hits:
+        confidence = _MODE_CONFIDENCE.get(hit.detection_mode, 0.55)
+        method_label = _MODE_LABEL.get(hit.detection_mode, hit.detection_mode)
         finding = Finding(
             source="account_probe",
             evidence_chain=[
                 f"Username probe: '{username}' resolves to a live page",
                 f"Site: {hit.site} ({hit.category})",
                 f"URL: {hit.url}",
+                f"Detection: {method_label}",
             ],
-            confidence=0.65,
+            confidence=confidence,
             risk_level=hit.risk_level,  # type: ignore[arg-type]
             remediation=_account_probe_remediation(hit.site, hit.url, hit.category),
             metadata={
                 "site": hit.site,
                 "url": hit.url,
                 "category": hit.category,
+                "detection_mode": hit.detection_mode,
             },
         )
         payload = finding.to_dict()
@@ -786,6 +809,411 @@ def _domain_of(url: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Free email-discovery pivots (GitHub, permutator, Wayback, EmailRep).
+# ---------------------------------------------------------------------------
+
+
+import re as _re
+
+# Lenient email regex for scanning Wayback / harvested HTML. The
+# downstream Gravatar / HIBP / EmailRep probes weed out anything that
+# isn't real, so false positives here only cost a few extra HTTP probes.
+_EMAIL_RE = _re.compile(
+    r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"
+)
+
+
+def _harvest_emails_from_text(text: str) -> set[str]:
+    if not text:
+        return set()
+    out: set[str] = set()
+    for m in _EMAIL_RE.findall(text):
+        s = m.strip().strip(".,;:)>]\"'").lower()
+        if "@" in s and "." in s.split("@", 1)[1]:
+            out.add(s)
+    return out
+
+
+async def _run_github_lookup(
+    session: SessionState,
+    http,
+    username: str,
+    seen_emails: set[str],
+) -> None:
+    """Free GitHub harvest: profile email + recent-commit author emails.
+
+    Cross-references discovered emails into ``seen_emails`` so the later
+    Gravatar / HIBP / IntelBase / searchcode / EmailRep pivots all
+    probe them.
+    """
+    if not username:
+        return
+
+    try:
+        profile = await _github_lookup.lookup(username, http)
+    except Exception:
+        return
+    if profile is None or profile.is_empty:
+        return
+
+    findings_log: list[dict] = session.data.setdefault("findings", [])
+
+    new_emails: list[str] = []
+    if profile.email:
+        new_emails.append(profile.email)
+    new_emails.extend(profile.commit_emails)
+
+    evidence_chain = [
+        f"GitHub user: {profile.login}",
+        f"Profile: {profile.profile_url}",
+    ]
+    if profile.name:
+        evidence_chain.append(f"Real name: {profile.name}")
+    if profile.email:
+        evidence_chain.append(f"Public profile email: {profile.email}")
+    if profile.commit_emails:
+        evidence_chain.append(
+            f"Commit author emails: {', '.join(profile.commit_emails[:5])}"
+        )
+    if profile.noreply_commit_emails:
+        evidence_chain.append(
+            f"Noreply commit aliases: {len(profile.noreply_commit_emails)} "
+            "(privacy-protected)"
+        )
+    if profile.company:
+        evidence_chain.append(f"Company: {profile.company}")
+    if profile.location:
+        evidence_chain.append(f"Location: {profile.location}")
+    if profile.blog:
+        evidence_chain.append(f"Blog/site: {profile.blog}")
+    if profile.twitter_username:
+        evidence_chain.append(f"Twitter: @{profile.twitter_username}")
+
+    risk = "HIGH" if new_emails else "MEDIUM"
+    finding = Finding(
+        source="github_lookup",
+        evidence_chain=evidence_chain,
+        confidence=0.9 if new_emails else 0.7,
+        risk_level=risk,  # type: ignore[arg-type]
+        remediation=(
+            "Edit your GitHub profile at github.com/settings/profile and "
+            "either remove the public email, set it to a noreply alias "
+            "(github.com/settings/emails — 'Keep my email addresses "
+            "private'), or rewrite git history to scrub the leaked address. "
+            "Run `git config --global user.email <noreply>` so future "
+            "commits don't re-leak it."
+        ),
+        metadata={
+            "github_login": profile.login,
+            "profile_url": profile.profile_url,
+            "name": profile.name,
+            "profile_email": profile.email,
+            "commit_emails": list(profile.commit_emails),
+            "noreply_commit_emails": list(profile.noreply_commit_emails),
+            "company": profile.company,
+            "location": profile.location,
+            "blog": profile.blog,
+            "twitter_username": profile.twitter_username,
+            "public_repos": profile.public_repos,
+        },
+    )
+    payload = finding.to_dict()
+    tagged = dict(payload)
+    tagged["_pipeline"] = _PIPELINE
+    findings_log.append(tagged)
+    await session.publish_event(_finding_event(_PIPELINE, payload))
+
+    for e in new_emails:
+        e_low = e.strip().lower()
+        if e_low and "@" in e_low:
+            seen_emails.add(e_low)
+
+
+async def _run_email_permutator(
+    session: SessionState,
+    http,
+    profile: dict,
+    username: str,
+    seen_emails: set[str],
+) -> None:
+    """Generate likely emails from full_name × common providers, then
+    confirm each by probing Gravatar (free, fast). Confirmed emails get
+    added to ``seen_emails`` so downstream pivots cross-reference them.
+    """
+    full_name = str(profile.get("full_name", "") or "")
+    if not full_name:
+        return
+
+    extra: tuple[str, ...] = ()
+    ext_url = str(profile.get("external_url", "") or "")
+    domain = _email_permutator.domain_from_url(ext_url)
+    if domain and "." in domain and domain not in (
+        "instagram.com",
+        "linktr.ee",
+        "linktree.com",
+        "beacons.ai",
+        "bio.link",
+    ):
+        extra = (domain,)
+
+    candidates = _email_permutator.generate_candidates(
+        full_name=full_name,
+        username=username,
+        extra_domains=extra,
+        max_candidates=40,
+    )
+    if not candidates:
+        return
+
+    findings_log: list[dict] = session.data.setdefault("findings", [])
+
+    confirmed: list[str] = []
+    for candidate in candidates:
+        if candidate in seen_emails:
+            continue
+        try:
+            gprofile = await _gravatar.lookup_email(candidate, http)
+        except Exception:
+            continue
+        if gprofile is None:
+            continue
+        # A 200 response with parseable JSON confirms the address is
+        # registered to a real Gravatar account, even if the entry is
+        # sparse.
+        confirmed.append(candidate)
+        seen_emails.add(candidate)
+
+        evidence_chain = [
+            f"Permutator candidate: {candidate}",
+            f"Generated from: full_name='{full_name}'"
+            + (f", username='{username}'" if username else ""),
+            f"Confirmed via Gravatar: {gprofile.raw_url}",
+        ]
+        if gprofile.full_name:
+            evidence_chain.append(f"Gravatar real name: {gprofile.full_name}")
+        if gprofile.preferred_username:
+            evidence_chain.append(
+                f"Gravatar username: {gprofile.preferred_username}"
+            )
+
+        finding = Finding(
+            source="email_permutator",
+            evidence_chain=evidence_chain,
+            confidence=0.8,
+            risk_level="HIGH",
+            remediation=(
+                f"The address {candidate} is one of the most-likely "
+                "permutations of your name and was confirmed live via "
+                "Gravatar. Audit and lock down the Gravatar profile at "
+                "gravatar.com, and consider migrating to a less-guessable "
+                "email alias for future signups."
+            ),
+            metadata={
+                "candidate": candidate,
+                "full_name": full_name,
+                "username": username,
+                "gravatar_url": gprofile.raw_url,
+                "gravatar_full_name": gprofile.full_name,
+                "gravatar_preferred_username": gprofile.preferred_username,
+            },
+        )
+        payload = finding.to_dict()
+        tagged = dict(payload)
+        tagged["_pipeline"] = _PIPELINE
+        findings_log.append(tagged)
+        await session.publish_event(_finding_event(_PIPELINE, payload))
+
+    if confirmed:
+        await session.publish_event(
+            _pipeline_status_event(
+                _PIPELINE,
+                "running",
+                f"Email permutator confirmed {len(confirmed)} candidate(s) via Gravatar.",
+            )
+        )
+
+
+# Hosts whose live HTML is gated when logged-out — Wayback snapshots
+# are usually the only way to scrape their public profile body.
+_WAYBACK_TARGET_HOSTS = (
+    "linkedin.com",
+    "facebook.com",
+    "instagram.com",
+    "x.com",
+    "twitter.com",
+    "quora.com",
+    "medium.com",
+)
+
+
+async def _run_wayback_pivot(
+    session: SessionState,
+    http,
+    seen_urls: set[str],
+    seen_emails: set[str],
+) -> None:
+    """Fetch Wayback snapshots for any gated-domain URLs surfaced during
+    dorking and harvest emails from the archived HTML."""
+    if not seen_urls:
+        return
+
+    targets = [
+        u for u in seen_urls
+        if any(h in (urlparse(u).netloc or "").lower() for h in _WAYBACK_TARGET_HOSTS)
+    ]
+    if not targets:
+        return
+
+    # Cap aggressively — Wayback snapshots are heavy and IA gets cranky
+    # under sustained load. Top 5 LinkedIn-class URLs is plenty.
+    targets = targets[:5]
+
+    findings_log: list[dict] = session.data.setdefault("findings", [])
+
+    for url in targets:
+        try:
+            snapshot = await _wayback.latest_snapshot(url, http)
+        except Exception:
+            continue
+        if snapshot is None:
+            continue
+        try:
+            text = await _wayback.fetch_snapshot_text(snapshot, http)
+        except Exception:
+            text = ""
+
+        harvested = _harvest_emails_from_text(text)
+        new_for_url = sorted(harvested - seen_emails)
+
+        evidence_chain = [
+            f"Original URL (gated/altered): {snapshot.original_url}",
+            f"Wayback snapshot: {snapshot.snapshot_url}",
+            f"Snapshot date: {snapshot.timestamp[:8]}",
+        ]
+        if new_for_url:
+            evidence_chain.append(
+                f"Emails harvested from snapshot: {', '.join(new_for_url[:5])}"
+            )
+        else:
+            evidence_chain.append(
+                "No new emails in snapshot, but archived body is publicly readable."
+            )
+
+        risk = "HIGH" if new_for_url else "MEDIUM"
+        finding = Finding(
+            source="wayback",
+            evidence_chain=evidence_chain,
+            confidence=0.75 if new_for_url else 0.55,
+            risk_level=risk,  # type: ignore[arg-type]
+            remediation=(
+                f"The Internet Archive holds a snapshot of {snapshot.original_url} "
+                f"taken on {snapshot.timestamp[:8]}. Even if you've since edited "
+                "or deleted the live page, the archived copy is public. Submit "
+                "a removal request via archive.org/about/contact (cite the "
+                f"snapshot URL: {snapshot.snapshot_url})."
+            ),
+            metadata={
+                "original_url": snapshot.original_url,
+                "snapshot_url": snapshot.snapshot_url,
+                "timestamp": snapshot.timestamp,
+                "harvested_emails": new_for_url,
+            },
+        )
+        payload = finding.to_dict()
+        tagged = dict(payload)
+        tagged["_pipeline"] = _PIPELINE
+        findings_log.append(tagged)
+        await session.publish_event(_finding_event(_PIPELINE, payload))
+
+        for e in new_for_url:
+            seen_emails.add(e)
+
+
+async def _run_emailrep_pivot(
+    session: SessionState,
+    http,
+    seen_emails: set[str],
+) -> None:
+    """EmailRep.io free reputation/existence cross-reference. Caps at
+    8 lookups per audit because the anonymous tier is severely
+    rate-limited."""
+    if not seen_emails:
+        return
+
+    targets = sorted(seen_emails)[:8]
+
+    findings_log: list[dict] = session.data.setdefault("findings", [])
+
+    rate_limited = False
+    for email in targets:
+        if rate_limited:
+            break
+        try:
+            result = await _emailrep.lookup_email(email, http)
+        except Exception:
+            continue
+        if result is None:
+            # Could be 429 — assume rate-limit and stop further probes.
+            rate_limited = True
+            continue
+        if not result.has_signal:
+            continue
+
+        evidence_chain = [
+            f"Email: {email}",
+            f"EmailRep: {result.raw_url}",
+        ]
+        if result.reputation:
+            evidence_chain.append(f"Reputation: {result.reputation}")
+        if result.deliverable:
+            evidence_chain.append("Deliverable: yes (MX-confirmed)")
+        if result.first_seen:
+            evidence_chain.append(f"First seen: {result.first_seen}")
+        if result.profiles:
+            evidence_chain.append(
+                f"Registered on: {', '.join(result.profiles[:8])}"
+            )
+        if result.data_breach:
+            evidence_chain.append("Found in known data breaches.")
+        if result.credentials_leaked:
+            evidence_chain.append("Credentials previously leaked.")
+
+        risk = "CRITICAL" if result.credentials_leaked else (
+            "HIGH" if (result.data_breach or result.profiles) else "MEDIUM"
+        )
+
+        finding = Finding(
+            source="emailrep",
+            evidence_chain=evidence_chain,
+            confidence=0.8,
+            risk_level=risk,  # type: ignore[arg-type]
+            remediation=(
+                f"EmailRep.io aggregates public reputation signals for "
+                f"{email}. The address is a known identifier across "
+                f"{len(result.profiles)} site(s); rotate any reused "
+                "passwords, enable 2FA on every linked account, and "
+                "consider an email alias for new signups."
+            ),
+            metadata={
+                "email": email,
+                "reputation": result.reputation,
+                "suspicious": result.suspicious,
+                "deliverable": result.deliverable,
+                "data_breach": result.data_breach,
+                "credentials_leaked": result.credentials_leaked,
+                "first_seen": result.first_seen,
+                "last_seen": result.last_seen,
+                "profiles": list(result.profiles),
+            },
+        )
+        payload = finding.to_dict()
+        tagged = dict(payload)
+        tagged["_pipeline"] = _PIPELINE
+        findings_log.append(tagged)
+        await session.publish_event(_finding_event(_PIPELINE, payload))
+
+
+# ---------------------------------------------------------------------------
 # Entry point.
 # ---------------------------------------------------------------------------
 
@@ -985,13 +1413,35 @@ async def run(session: SessionState) -> None:
                     if _is_email_value(finding_type) and value:
                         seen_emails.add(value.lower())
 
-        # ---- Post-dork pass: account probe + breach check ----------------
+        # ---- Post-dork pass: surface more emails before the cross-ref ----
+        # Order matters: each step here can add to ``seen_emails``, and
+        # later pivots cross-reference everything in that set.
         await _run_account_probe(session, username, http)
+
+        # 1. GitHub harvest (free) — public profile email + commit
+        #    author emails. Biggest single source of personal email
+        #    leakage for any developer target.
+        await _run_github_lookup(session, http, username, seen_emails)
+
+        # 2. Email permutator (free) — generate name-based candidates and
+        #    confirm them via Gravatar. Confirmed candidates flow into
+        #    seen_emails for the rest of the cross-reference loop.
+        await _run_email_permutator(session, http, profile, username, seen_emails)
+
+        # 3. Wayback Machine (free) — pull archived snapshots of any
+        #    LinkedIn / FB / X / Quora / Medium URLs surfaced during
+        #    dorking; harvest emails from the archived HTML.
+        await _run_wayback_pivot(session, http, seen_urls, seen_emails)
+
+        # ---- Cross-reference pass: feed every email through every lookup -
         await _run_breach_check(session, http, seen_emails)
         await _run_intelbase_lookup(session, http, seen_emails)
-        # SpiderFoot-derived pivots (free, no auth).
+        # SpiderFoot-derived + free pivots.
         await _run_searchcode_pivot(session, http, username, seen_emails)
         await _run_gravatar_pivot(session, http, seen_emails)
+        # 4. EmailRep.io (free) — final reputation / known-profile
+        #    cross-reference per discovered email.
+        await _run_emailrep_pivot(session, http, seen_emails)
 
         await session.publish_event(_pipeline_status_event(_PIPELINE, "complete"))
     except Exception as exc:  # noqa: BLE001 — defensive top-level guard

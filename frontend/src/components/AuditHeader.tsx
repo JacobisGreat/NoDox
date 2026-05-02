@@ -29,21 +29,17 @@ export default function AuditHeader({
   streamDone,
 }: Props) {
   return (
-    <header className="sticky top-0 z-30 border-b border-nodoxx-border/30 bg-nodoxx-bg/95 backdrop-blur-md">
+    <header className="sticky top-0 z-30 border-b border-nodoxx-border bg-nodoxx-bg/95 backdrop-blur-md">
       <div className="mx-auto flex w-full max-w-7xl flex-col gap-3 px-4 py-3 sm:px-6 lg:flex-row lg:items-center lg:gap-6">
         <div className="flex min-w-0 items-center gap-3">
           <a
             href="/"
-            className="select-none font-mono text-base font-bold tracking-[0.18em] text-nodoxx-accent hover:brightness-110"
+            className="select-none font-mono text-base font-bold tracking-[0.22em] text-nodoxx-text hover:text-nodoxx-muted"
           >
             NODOXX
           </a>
-          <span className="hidden h-5 w-px bg-nodoxx-border/40 sm:block" />
-          {profile ? (
-            <ProfileBlock profile={profile} />
-          ) : (
-            <ProfileSkeleton />
-          )}
+          <span className="hidden h-5 w-px bg-nodoxx-border sm:block" />
+          {profile ? <ProfileBlock profile={profile} /> : <ProfileSkeleton />}
         </div>
 
         <div className="flex flex-wrap items-center gap-x-6 gap-y-2 lg:ml-auto">
@@ -51,7 +47,7 @@ export default function AuditHeader({
             <span className="font-mono text-xl font-bold tabular-nums text-nodoxx-text">
               {totalFindings}
             </span>
-            <span className="text-xs uppercase tracking-wider text-nodoxx-muted">
+            <span className="text-[10px] font-mono uppercase tracking-[0.2em] text-nodoxx-muted">
               findings
             </span>
           </div>
@@ -64,11 +60,11 @@ export default function AuditHeader({
         </div>
       </div>
 
-      <div className="mx-auto flex w-full max-w-7xl flex-wrap items-center gap-2 px-4 pb-3 sm:px-6">
+      <div className="mx-auto flex w-full max-w-7xl flex-wrap items-center gap-3 px-4 pb-3 sm:px-6">
         {PIPELINES.map((p) => (
           <div key={p} className="flex items-center gap-2">
-            <span className="text-[11px] uppercase tracking-wider text-nodoxx-muted">
-              {pipelineTitle(p)}
+            <span className="font-mono text-[10px] uppercase tracking-[0.2em] text-nodoxx-muted">
+              [{pipelineTitle(p)}]
             </span>
             <StatusChip
               status={pipelineStatuses[p].status}
@@ -88,7 +84,7 @@ function ProfileBlock({ profile }: { profile: Profile }) {
         src={profile.profile_pic_url}
         alt=""
         referrerPolicy="no-referrer"
-        className="h-10 w-10 flex-shrink-0 rounded-full border border-nodoxx-border/40 bg-nodoxx-panel object-cover"
+        className="h-10 w-10 flex-shrink-0 border border-nodoxx-border bg-nodoxx-panel object-cover grayscale"
         onError={(e) => {
           (e.currentTarget as HTMLImageElement).style.visibility = "hidden";
         }}
@@ -108,10 +104,10 @@ function ProfileBlock({ profile }: { profile: Profile }) {
 function ProfileSkeleton() {
   return (
     <div className="flex items-center gap-3">
-      <div className="h-10 w-10 animate-pulse rounded-full bg-nodoxx-panel" />
+      <div className="h-10 w-10 animate-pulse bg-nodoxx-panel" />
       <div className="flex flex-col gap-1">
-        <div className="h-3 w-24 animate-pulse rounded bg-nodoxx-panel" />
-        <div className="h-2 w-16 animate-pulse rounded bg-nodoxx-panel" />
+        <div className="h-3 w-24 animate-pulse bg-nodoxx-panel" />
+        <div className="h-2 w-16 animate-pulse bg-nodoxx-panel" />
       </div>
     </div>
   );
@@ -124,21 +120,21 @@ function ConnectionDot({
   connected: boolean;
   streamDone: boolean;
 }) {
-  let color = "bg-slate-500";
+  let cls = "bg-nodoxx-dim";
   let label = "connecting";
   if (streamDone) {
-    color = "bg-risk-low";
+    cls = "bg-nodoxx-text";
     label = "done";
   } else if (connected) {
-    color = "bg-nodoxx-accent animate-running-pulse";
+    cls = "bg-nodoxx-text animate-running-pulse";
     label = "live";
   }
   return (
     <span
       title={label}
-      className="flex items-center gap-1.5 font-mono text-[10px] uppercase tracking-wider text-nodoxx-muted"
+      className="flex items-center gap-1.5 font-mono text-[10px] uppercase tracking-[0.18em] text-nodoxx-muted"
     >
-      <span className={`h-2 w-2 rounded-full ${color}`} />
+      <span className={`h-2 w-2 ${cls}`} />
       {label}
     </span>
   );

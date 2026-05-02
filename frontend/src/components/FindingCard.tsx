@@ -18,20 +18,17 @@ export default function FindingCard({ finding }: Props) {
 
   return (
     <article
-      className="animate-card-in rounded-lg bg-nodoxx-panel"
-      style={{
-        borderLeft: `3px solid ${borderColor}`,
-        boxShadow: "0 0 0 1px rgba(31,63,99,0.18)",
-      }}
+      className="animate-card-in border border-nodoxx-border bg-nodoxx-panel2"
+      style={{ borderLeft: `3px solid ${borderColor}` }}
     >
       <div className="space-y-3 p-4">
         <header className="flex items-start justify-between gap-3">
           <span className="font-mono text-[11px] uppercase tracking-[0.18em] text-nodoxx-muted">
-            {finding.source}
+            // {finding.source}
           </span>
           <span
-            className={`shrink-0 rounded-full border px-2 py-0.5 font-mono text-[10px] font-semibold uppercase tracking-wider ${riskBgClass(
-              finding.risk_level
+            className={`shrink-0 border px-2 py-0.5 font-mono text-[10px] font-semibold uppercase tracking-[0.18em] ${riskBgClass(
+              finding.risk_level,
             )}`}
           >
             {finding.risk_level}
@@ -43,18 +40,25 @@ export default function FindingCard({ finding }: Props) {
             {finding.evidence_chain.map((item, idx) => (
               <li
                 key={idx}
-                className="flex gap-2 text-sm leading-relaxed text-nodoxx-text/90"
+                className="flex gap-2 font-mono text-[13px] leading-relaxed text-nodoxx-text/90"
               >
-                <span aria-hidden="true" className="mt-1.5 inline-block h-1 w-1 shrink-0 rounded-full bg-nodoxx-accent/70" />
-                <span className="min-w-0 break-words">{renderEvidence(item)}</span>
+                <span
+                  aria-hidden="true"
+                  className="select-none pt-0.5 font-mono text-xs text-nodoxx-muted"
+                >
+                  &gt;
+                </span>
+                <span className="min-w-0 break-words">
+                  {renderEvidence(item)}
+                </span>
               </li>
             ))}
           </ul>
         )}
 
         <div className="flex items-center gap-3">
-          <span className="text-[10px] font-mono uppercase tracking-wider text-nodoxx-muted/70">
-            confidence
+          <span className="text-[10px] font-mono uppercase tracking-[0.2em] text-nodoxx-muted">
+            conf
           </span>
           <span
             className="font-mono text-sm font-semibold tabular-nums"
@@ -62,19 +66,17 @@ export default function FindingCard({ finding }: Props) {
           >
             {formatConfidence(finding.confidence)}
           </span>
-          <div className="relative h-1 flex-1 overflow-hidden rounded-full bg-nodoxx-bg">
+          <div className="relative h-[3px] flex-1 overflow-hidden bg-nodoxx-bg">
             <div
-              className="h-full rounded-full transition-[width] duration-500"
+              className="h-full transition-[width] duration-500"
               style={{ width: `${confidencePct}%`, backgroundColor: confColor }}
             />
           </div>
         </div>
 
-        <div
-          className="rounded-md border-l-2 border-nodoxx-accent/70 bg-[#0d1525] px-3 py-2 text-sm text-nodoxx-text/90"
-        >
-          <span className="mb-0.5 block text-[10px] font-mono uppercase tracking-wider text-nodoxx-accent/80">
-            remediation
+        <div className="border-l-2 border-nodoxx-text/70 bg-nodoxx-bg px-3 py-2 font-mono text-[13px] text-nodoxx-text/90">
+          <span className="mb-0.5 block font-mono text-[10px] uppercase tracking-[0.2em] text-nodoxx-muted">
+            $ remediation
           </span>
           <span className="leading-relaxed">{finding.remediation}</span>
         </div>
@@ -93,7 +95,7 @@ function renderEvidence(text: string) {
           href={seg.value}
           target="_blank"
           rel="noopener noreferrer"
-          className="font-mono text-nodoxx-accent underline decoration-nodoxx-accent/40 underline-offset-2 hover:decoration-nodoxx-accent break-all"
+          className="font-mono text-nodoxx-text underline decoration-nodoxx-muted underline-offset-2 hover:decoration-nodoxx-text break-all"
         >
           {seg.value}
         </a>

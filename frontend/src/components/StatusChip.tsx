@@ -10,11 +10,9 @@ export default function StatusChip({ status, detail }: Props) {
   return (
     <span
       title={detail ?? config.label}
-      className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-[11px] font-mono uppercase tracking-wider ${config.classes}`}
+      className={`inline-flex items-center gap-1.5 border px-2.5 py-0.5 text-[10px] font-mono uppercase tracking-[0.18em] ${config.classes}`}
     >
-      <span className={`inline-flex h-2 w-2 ${config.dot}`}>
-        {config.icon}
-      </span>
+      <span className={`inline-flex h-2 w-2 ${config.dot}`}>{config.icon}</span>
       <span>{config.label}</span>
     </span>
   );
@@ -26,40 +24,46 @@ const STATUS_CONFIG: Record<
 > = {
   idle: {
     label: "idle",
-    classes: "bg-slate-700/30 text-slate-400 border-slate-600/40",
-    dot: "rounded-full bg-slate-400/70",
+    classes: "bg-transparent text-nodoxx-dim border-nodoxx-border",
+    dot: "bg-nodoxx-dim",
     icon: null,
   },
   running: {
     label: "running",
     classes:
-      "bg-nodoxx-accent/15 text-nodoxx-accent border-nodoxx-accent/40 animate-running-pulse",
-    dot: "rounded-full bg-nodoxx-accent",
+      "bg-white/[0.06] text-nodoxx-text border-nodoxx-text/60 animate-running-pulse",
+    dot: "bg-nodoxx-text",
     icon: null,
   },
   complete: {
     label: "complete",
-    classes: "bg-risk-low/15 text-risk-low border-risk-low/40",
-    dot: "items-center justify-center text-risk-low",
+    classes: "bg-transparent text-nodoxx-text border-nodoxx-text/40",
+    dot: "items-center justify-center text-nodoxx-text",
     icon: <CheckIcon />,
   },
   error: {
     label: "error",
-    classes: "bg-risk-high/15 text-risk-high border-risk-high/40",
-    dot: "items-center justify-center text-risk-high",
+    classes: "bg-white/10 text-nodoxx-text border-nodoxx-text",
+    dot: "items-center justify-center text-nodoxx-text",
     icon: <XIcon />,
   },
   budget_exceeded: {
     label: "budget",
-    classes: "bg-risk-medium/15 text-risk-medium border-risk-medium/40",
-    dot: "rounded-full bg-risk-medium",
+    classes: "bg-white/[0.04] text-nodoxx-muted border-nodoxx-muted/60",
+    dot: "bg-nodoxx-muted",
     icon: null,
   },
 };
 
 function CheckIcon() {
   return (
-    <svg viewBox="0 0 12 12" className="h-2.5 w-2.5" fill="none" stroke="currentColor" strokeWidth="2">
+    <svg
+      viewBox="0 0 12 12"
+      className="h-2.5 w-2.5"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+    >
       <path d="M2 6.5L5 9l5-6" strokeLinecap="round" strokeLinejoin="round" />
     </svg>
   );
@@ -67,7 +71,13 @@ function CheckIcon() {
 
 function XIcon() {
   return (
-    <svg viewBox="0 0 12 12" className="h-2.5 w-2.5" fill="none" stroke="currentColor" strokeWidth="2">
+    <svg
+      viewBox="0 0 12 12"
+      className="h-2.5 w-2.5"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+    >
       <path d="M3 3l6 6M9 3l-6 6" strokeLinecap="round" />
     </svg>
   );
