@@ -29,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+import random
 import re
 from typing import Any
 from urllib.parse import urljoin, urlparse
@@ -161,12 +162,77 @@ _TW_IMAGE_RE = re.compile(
     r'<meta[^>]+name=["\']twitter:image["\'][^>]+content=["\']([^"\']+)["\']',
     re.IGNORECASE,
 )
+# Many real profile pages don't set og:image to the user's avatar (a site
+# default ships there instead). apple-touch-icon is sometimes per-user;
+# avatar-class img tags are a richer fallback for the rendered avatar.
+_APPLE_TOUCH_RE = re.compile(
+    r'<link[^>]+rel=["\']apple-touch-icon[^"\']*["\'][^>]+href=["\']([^"\']+)["\']',
+    re.IGNORECASE,
+)
+_AVATAR_IMG_RE = re.compile(
+    r'<img[^>]+(?:class|id)=["\'][^"\']*avatar[^"\']*["\'][^>]+src=["\']([^"\']+)["\']',
+    re.IGNORECASE,
+)
 _DESCRIPTION_RE = re.compile(
     r'<meta[^>]+name=["\']description["\'][^>]+content=["\']([^"\']+)["\']',
     re.IGNORECASE,
 )
 _TAG_STRIP_RE = re.compile(r"<[^>]+>")
 _WHITESPACE_RE = re.compile(r"\s+")
+
+# `<a href="...">` extractor for the external_url crawl. Looks deliberately
+# lax — linktree / beacons / personal sites use very different markup and
+# we just want hosts, not parsed link metadata.
+_HREF_RE = re.compile(r'href=["\']([^"\']+)["\']', re.IGNORECASE)
+
+
+def _normalize_host(url: str) -> str:
+    try:
+        host = urlparse(url).netloc.lower()
+    except Exception:
+        return ""
+    if host.startswith("www."):
+        host = host[4:]
+    return host
+
+
+async def _collect_external_url_hosts(
+    external_url: str, http: httpx.AsyncClient
+) -> frozenset[str]:
+    """Fetch the IG bio's external_url (linktree, personal site, etc.) and
+    return the set of distinct hosts it links to. Treated downstream as
+    the user themselves vouching for those profiles — the strongest
+    corroborating signal we can get cheaply."""
+    if not external_url:
+        return frozenset()
+    try:
+        resp = await http.get(
+            external_url,
+            headers=_HEADERS,
+            timeout=_REQUEST_TIMEOUT,
+            follow_redirects=True,
+        )
+    except Exception as exc:
+        logger.debug("external_url crawl failed for %s: %s", external_url, exc)
+        return frozenset()
+    body = ""
+    try:
+        body = resp.text or ""
+    except Exception:
+        return frozenset()
+    body = body[:_BODY_MATCH_BYTES]
+    self_host = _normalize_host(external_url)
+    hosts: set[str] = set()
+    for match in _HREF_RE.finditer(body):
+        href = match.group(1).strip()
+        if not href or href.startswith(("#", "mailto:", "tel:", "javascript:")):
+            continue
+        absolute = urljoin(external_url, href)
+        host = _normalize_host(absolute)
+        if not host or host == self_host:
+            continue
+        hosts.add(host)
+    return frozenset(hosts)
 
 
 # --------------------------------------------------------------------- #
@@ -279,7 +345,7 @@ def _extract_bio(snippet: str) -> str | None:
 
 
 def _extract_image(snippet: str, base_url: str) -> str | None:
-    for pat in (_OG_IMAGE_RE, _TW_IMAGE_RE):
+    for pat in (_OG_IMAGE_RE, _TW_IMAGE_RE, _AVATAR_IMG_RE, _APPLE_TOUCH_RE):
         v = _first_match(pat, snippet)
         if v:
             return urljoin(base_url, _strip_html(v))
@@ -293,7 +359,10 @@ def _hamming_score(a: Any | None, b: Any | None) -> float | None:
         distance = int(a - b)
     except Exception:
         return None
-    if distance > 10:
+    # Tighter cutoff than before: distance 8 ≈ similarity 0.875, which is
+    # the floor where a pHash match is worth treating as positive
+    # corroboration vs. coincidental visual overlap.
+    if distance > 8:
         return None
     return max(0.0, 1.0 - distance / 64.0)
 
@@ -375,6 +444,7 @@ def _is_claimed(
     platform: dict[str, Any],
     status_code: int,
     body_for_match: str,
+    username: str = "",
 ) -> bool:
     """Decide whether a probe response indicates the username is claimed.
 
@@ -407,14 +477,16 @@ def _is_claimed(
     error_types: list[str] = list(platform.get("error_types") or [])
     if not error_types:
         error_types = ["status_code"]
+    message_only = (
+        "message" in error_types and "status_code" not in error_types
+    )
 
     # Defensive 2xx gate for message-only sites: a 30x/4xx/5xx response
     # never has a valid profile body regardless of which negative
     # patterns aren't in it. Without this, redirects-to-error masquerade
     # as hits (AniWorld 302, etc.).
-    if "message" in error_types and "status_code" not in error_types:
-        if not (200 <= status_code < 300):
-            return False
+    if message_only and not (200 <= status_code < 300):
+        return False
 
     for et in error_types:
         if et == "message":
@@ -439,6 +511,15 @@ def _is_claimed(
                 "Unknown errorType %r on %s; skipping", et, platform.get("name")
             )
             return False
+
+    # Message-only Sherlock entries are the high-FP class: a 200 with
+    # error string absent is taken as "claimed", which breaks when the
+    # site's error message has rotated or when it ships a generic
+    # landing page. Require the username to actually appear in the body
+    # so we have a positive signal, not just absence-of-negative.
+    if message_only and username:
+        if username.lower() not in body_for_match[:8000].lower():
+            return False
     return True
 
 
@@ -457,6 +538,7 @@ async def _check_platform(
     image_downloader: Any,
     sentence_model: Any | None,
     semaphore: asyncio.Semaphore,
+    external_url_hosts: frozenset[str] = frozenset(),
 ) -> Finding | None:
     name: str = platform["name"]
 
@@ -505,13 +587,24 @@ async def _check_platform(
         request_kwargs["json"] = _substitute_payload(payload, username)
 
     async with semaphore:
-        try:
-            resp = await http.request(method, probe_url, **request_kwargs)
-        except (httpx.HTTPError, asyncio.TimeoutError) as exc:
-            logger.debug("Skipping %s (%s): %s", name, probe_url, exc)
-            return None
-        except Exception as exc:
-            logger.debug("Unexpected error checking %s: %s", name, exc)
+        # One retry on transient transport errors. Jittered 1-3s backoff
+        # so a flaky platform doesn't burn the whole pipeline on a 502
+        # but we also don't synchronize a thundering herd on retry.
+        resp = None
+        for attempt in range(2):
+            try:
+                resp = await http.request(method, probe_url, **request_kwargs)
+                break
+            except (httpx.HTTPError, asyncio.TimeoutError) as exc:
+                if attempt == 0:
+                    await asyncio.sleep(1.0 + random.random() * 2.0)
+                    continue
+                logger.debug("Skipping %s (%s): %s", name, probe_url, exc)
+                return None
+            except Exception as exc:
+                logger.debug("Unexpected error checking %s: %s", name, exc)
+                return None
+        if resp is None:
             return None
 
         try:
@@ -525,7 +618,7 @@ async def _check_platform(
     if _looks_like_waf(body_for_match):
         return None
 
-    if not _is_claimed(platform, resp.status_code, body_for_match):
+    if not _is_claimed(platform, resp.status_code, body_for_match, username):
         return None
 
     # ---------- scoring ----------
@@ -580,9 +673,20 @@ async def _check_platform(
             logger.debug("bio compare failed for %s: %s", name, exc)
             bio_similarity = None
 
+    # External-URL corroboration: the user's IG bio links out to a personal
+    # site / linktree, and that site links to THIS profile's host. As close
+    # to a self-attestation as we can get from public signals — strongest
+    # weight in the mix.
+    display_host = _normalize_host(display_url)
+    external_url_match = bool(
+        display_host and external_url_hosts and display_host in external_url_hosts
+    )
+
     # Weighted-mean confidence. Bare URL hit (Sherlock-confirmed) is
     # 0.30; a strong corroborating signal can push it higher.
     weights: list[tuple[float, float]] = [(0.30, 1.0)]
+    if external_url_match:
+        weights.append((0.40, 1.0))
     if username_in_title:
         # Direct corroboration — the username appears on the rendered
         # page title — typical of true user-profile pages.
@@ -590,7 +694,10 @@ async def _check_platform(
     if display_name and name_similarity >= 0.4:
         weights.append((0.35, max(0.0, min(1.0, name_similarity))))
     if photo_similarity is not None:
-        weights.append((0.25, max(0.0, min(1.0, photo_similarity))))
+        # Stronger weight than before: with the tighter distance cutoff in
+        # _hamming_score, a non-None similarity now means "near-identical
+        # avatar" rather than "loosely similar".
+        weights.append((0.30, max(0.0, min(1.0, photo_similarity))))
     if bio_similarity is not None:
         weights.append((0.15, max(0.0, min(1.0, bio_similarity))))
 
@@ -626,6 +733,10 @@ async def _check_platform(
     evidence: list[str] = [
         f"Username '{username}' resolves to a live page at {display_url}"
     ]
+    if external_url_match:
+        evidence.append(
+            f"Linked from the user's bio external_url (host {display_host})"
+        )
     if display_name:
         evidence.append(
             f"Page display name '{display_name[:120]}' "
@@ -656,6 +767,7 @@ async def _check_platform(
         "display_name": display_name or None,
         "detection": "+".join(platform.get("error_types") or []) or "wmn_two_sided",
         "nsfw": bool(platform.get("nsfw", False)),
+        "external_url_match": external_url_match,
     }
 
     remediation = _platform_remediation(
@@ -700,11 +812,23 @@ async def run(session: SessionState) -> None:
         full_name = str(profile.get("full_name", "")).strip()
         ig_bio = str(profile.get("biography", "")).strip()
         profile_pic_url = str(profile.get("profile_pic_url", "")).strip()
+        external_url = str(profile.get("external_url") or "").strip()
 
         http: httpx.AsyncClient | None = session.data.get("http")
         if http is None:
             http = httpx.AsyncClient(headers=_HEADERS, follow_redirects=True)
             session.data["http"] = http
+
+        # Crawl the bio external_url once up front so every per-platform
+        # check can corroborate against the hosts it links to.
+        external_url_hosts: frozenset[str] = frozenset()
+        if external_url:
+            try:
+                external_url_hosts = await _collect_external_url_hosts(
+                    external_url, http
+                )
+            except Exception as exc:
+                logger.debug("external_url collection failed: %s", exc)
 
         image_downloader = session.data.get("image_downloader")
 
@@ -734,6 +858,7 @@ async def run(session: SessionState) -> None:
                     image_downloader=image_downloader,
                     sentence_model=sentence_model,
                     semaphore=semaphore,
+                    external_url_hosts=external_url_hosts,
                 )
             except Exception as exc:
                 logger.debug("platform %s blew up: %s", p.get("name"), exc)

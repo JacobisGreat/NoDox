@@ -59,6 +59,24 @@ _HEADERS = {
 }
 
 
+# Hard blocklist for sites that have repeatedly false-positived even after the
+# detection guardrails (status >=400 short-circuit, 64KB body window,
+# message-only positive-signal requirement) were tightened. These sites are
+# message-only Sherlock entries whose upstream HTML changes more often than
+# the catalog tracks; the safest fix is to never emit a finding for them at
+# all. Names matched case-insensitively against ``platform["name"]``.
+#
+# Re-evaluate annually; remove an entry if upstream stabilizes a real 4xx
+# for non-existent users (Signal already does this, but the failure mode is
+# expensive enough that we keep the belt-and-suspenders guard in place).
+_BLOCKED_PROBE_NAMES: frozenset[str] = frozenset(
+    {
+        "signal",          # community.signalusers.org — Discourse 404
+        "discord.bio",     # discords.com api — message-only catalog rot
+    }
+)
+
+
 @dataclass(frozen=True)
 class ProbeHit:
     site: str
@@ -107,6 +125,8 @@ async def _check_one(
     the m_string negative marker. See ``IDENTITY_FALSE_POSITIVES.md``.
     """
     name = platform["name"]
+    if name.lower() in _BLOCKED_PROBE_NAMES:
+        return None  # known persistent FPs — never emit findings
     method = platform.get("method", "GET").upper()
     if method != "GET":
         return None  # POST sites handled by the identity pipeline

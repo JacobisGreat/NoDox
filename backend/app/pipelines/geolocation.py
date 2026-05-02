@@ -24,9 +24,12 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import logging
 import os
 import tempfile
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 from app.config import get_settings
 from app.schemas.events import (
@@ -758,22 +761,43 @@ async def _process_media_analyzer(
 
 async def _process_post(
     session: SessionState, post: dict
-) -> list[dict]:
-    """Run every channel for one post and return the signal list it produced."""
+) -> tuple[list[dict], bool]:
+    """Run every channel for one post.
+
+    Returns ``(signals, image_downloaded)`` so the caller can track how
+    many post images actually came down — Instagram's CDN often blocks
+    direct fetches and silently dropping every post would otherwise be
+    indistinguishable from "this user posts no location-bearing content".
+
+    Channel ordering is deliberate: the IG location tag lives in post
+    metadata and runs first regardless of whether the image is fetchable.
+    Image-bytes channels (EXIF/VLM/GeoCLIP/media-analyzer) only run when
+    the download succeeded.
+    """
+    signals: list[dict] = []
+
+    # Channel 2 first — Instagram location tag (no image bytes needed).
+    tag_signal = await _process_location_tag(session, post)
+    if tag_signal is not None:
+        signals.append(tag_signal)
+
     image_url = post.get("image_url")
     if not image_url:
-        return []
+        return signals, False
 
     downloader = session.data.get("image_downloader")
     if downloader is None:
-        return []
+        return signals, False
 
     try:
         image_bytes, media_type = await downloader.download(image_url)
-    except Exception:
-        return []
-
-    signals: list[dict] = []
+    except Exception as exc:
+        logger.debug(
+            "image download failed for post %s: %s",
+            post.get("shortcode") or "?",
+            exc,
+        )
+        return signals, False
 
     # Channel 1 — EXIF GPS. If present, also feed the aggregator.
     coords = await asyncio.to_thread(_extract_gps_sync, image_bytes)
@@ -829,11 +853,6 @@ async def _process_post(
             }
         )
 
-    # Channel 2 — Instagram location tag.
-    tag_signal = await _process_location_tag(session, post)
-    if tag_signal is not None:
-        signals.append(tag_signal)
-
     # Channel 3 — VLM analysis.
     vlm_signals = await _process_vlm(session, post, image_bytes, media_type)
     signals.extend(vlm_signals)
@@ -846,12 +865,11 @@ async def _process_post(
     try:
         media_signals = await _process_media_analyzer(session, post, image_bytes)
     except Exception as exc:  # noqa: BLE001 — never let one bad image stop the pipeline
-        logger = __import__("logging").getLogger(__name__)
         logger.debug("media_analyzer channel failed for post: %s", exc)
         media_signals = []
     signals.extend(media_signals)
 
-    return signals
+    return signals, True
 
 
 # ---------------------------------------------------------------------------
@@ -1052,12 +1070,45 @@ async def run(session: SessionState) -> None:
 
     try:
         posts: list[dict] = list(session.data.get("posts") or [])
+        video_count = sum(1 for p in posts if p.get("is_video"))
         image_posts = [p for p in posts if not p.get("is_video")]
         image_posts = image_posts[:_MAX_POSTS]
+
+        # Diagnostic: surface how many posts are actually scannable. Without
+        # this, an empty post list (Meta has been trimming the inline post
+        # payload on anonymous web_profile_info calls) silently produces
+        # zero findings and the pipeline reads as "instantly complete".
+        await session.publish_event(
+            _pipeline_status_event(
+                _PIPELINE,
+                "running",
+                (
+                    f"{len(posts)} post(s) loaded, "
+                    f"{video_count} video(s) skipped, "
+                    f"{len(image_posts)} image(s) queued for scanning."
+                ),
+            )
+        )
+
+        if not image_posts:
+            await session.publish_event(
+                _pipeline_status_event(
+                    _PIPELINE,
+                    "complete",
+                    (
+                        "No public image posts available to scan. Instagram's "
+                        "anonymous endpoint may have returned 0 posts for this "
+                        "profile, or all posts are videos."
+                    ),
+                )
+            )
+            return
 
         cost_tracker = session.data.get("cost_tracker")
         all_signals: list[dict] = []
         budget_exceeded = False
+        downloads_attempted = 0
+        downloads_ok = 0
 
         for post in image_posts:
             if cost_tracker is not None and not cost_tracker.can_spend(
@@ -1066,11 +1117,31 @@ async def run(session: SessionState) -> None:
                 budget_exceeded = True
                 break
             try:
-                signals = await _process_post(session, post)
+                signals, image_ok = await _process_post(session, post)
             except Exception:
                 # One bad post should never abort the pipeline.
                 continue
+            downloads_attempted += 1
+            if image_ok:
+                downloads_ok += 1
             all_signals.extend(signals)
+
+        # Surface CDN download outcome to the dashboard. Without this the
+        # user can't tell "no location signals because the account doesn't
+        # post locations" from "no location signals because Instagram CDN
+        # 403'd every download" — the latter is recoverable, the former
+        # isn't.
+        if downloads_attempted > 0 and downloads_ok < downloads_attempted:
+            await session.publish_event(
+                _pipeline_status_event(
+                    _PIPELINE,
+                    "running",
+                    (
+                        f"Downloaded {downloads_ok}/{downloads_attempted} post "
+                        "images (Instagram CDN may be blocking direct fetches)."
+                    ),
+                )
+            )
 
         if budget_exceeded:
             await session.publish_event(

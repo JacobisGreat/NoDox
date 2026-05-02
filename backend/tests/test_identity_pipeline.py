@@ -238,8 +238,13 @@ async def test_message_absent_means_user_claimed(sema):
         "category": "social_media",
     }
 
+    # Body must echo the username — message-only Sherlock entries now
+    # require a positive signal, not just absence-of-error, to avoid the
+    # generic-landing-page false positives (Signal/Discord.bio class).
     def handler(_req: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, text="<html>real user profile</html>")
+        return httpx.Response(
+            200, text="<html>realuser's profile — welcome</html>"
+        )
 
     async with _mock_http(handler) as http:
         result = await _check_platform(

@@ -55,6 +55,43 @@ _DOC_SITES: tuple[str, ...] = (
     "slideshare.net",
 )
 
+# People-search aggregators that index teaser pages — a logged-out
+# Google snippet often exposes the confirmed full name + city + age range,
+# even when the live page asks for payment. Sourced from sfp_pgp +
+# sfp_company analogues; trimmed to the ones that index reliably.
+_AGGREGATOR_SITES: tuple[str, ...] = (
+    "zoominfo.com",
+    "spokeo.com",
+    "beenverified.com",
+    "rocketreach.co",
+    "fastpeoplesearch.com",
+    "whitepages.com",
+    "truepeoplesearch.com",
+    "thatsthem.com",
+    "radaris.com",
+    "mylife.com",
+)
+
+# Public records hosts — court filings, dockets, judgements. Coverage
+# varies by jurisdiction; these four index in Google reliably enough that
+# a single dork sweep is worth the budget.
+_PUBLIC_RECORDS_SITES: tuple[str, ...] = (
+    "courtlistener.com",
+    "casetext.com",
+    "judyrecords.com",
+    "unicourt.com",
+)
+
+# WHOIS reverse-lookup mirrors — given an email, find domains registered
+# to it. Public Google-indexed result pages are the only free way to do
+# this without an API key.
+_WHOIS_REVERSE_SITES: tuple[str, ...] = (
+    "viewdns.info",
+    "domainwat.ch",
+    "domainbigdata.com",
+    "whoxy.com",
+)
+
 
 def dorks_for_username(username: str) -> list[str]:
     """SpiderFoot-flavored username dorks.
@@ -116,16 +153,31 @@ def dorks_for_email(email: str) -> list[str]:
         ]
     )
 
+    # WHOIS reverse — find domains historically registered with this
+    # email. The aggregators below all index Google-reachable result
+    # pages even when their live pages gate behind a captcha/login.
+    for site in _WHOIS_REVERSE_SITES:
+        queries.append(f'site:{site} "{email}"')
+
     return queries
 
 
 def dorks_for_full_name(full_name: str) -> list[str]:
     """SpiderFoot-flavored full-name dorks — biographies, document
-    mirrors, professional registries (sfp_filemeta + sfp_company)."""
+    mirrors, professional registries (sfp_filemeta + sfp_company),
+    people-search aggregators, and public-records hosts."""
     if not full_name:
         return []
     queries: list[str] = []
     for site in _DOC_SITES:
+        queries.append(f'site:{site} "{full_name}"')
+    # People-search aggregator teasers — Google snippets often surface
+    # confirmed name + location + age range from these pages even when
+    # the live page is paywalled.
+    for site in _AGGREGATOR_SITES:
+        queries.append(f'site:{site} "{full_name}"')
+    # Public records / court filings.
+    for site in _PUBLIC_RECORDS_SITES:
         queries.append(f'site:{site} "{full_name}"')
     queries.extend(
         [

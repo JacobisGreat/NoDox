@@ -23,6 +23,7 @@ Caveats:
 from __future__ import annotations
 
 import asyncio
+import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -171,12 +172,27 @@ def _profile_from_user(user: dict[str, Any], requested: str) -> InstagramProfile
     )
 
 
+def _session_cookies() -> dict[str, str] | None:
+    sessionid = (os.getenv("IG_SESSIONID") or "").strip()
+    if not sessionid:
+        return None
+    cookies = {"sessionid": sessionid}
+    ds_user_id = (os.getenv("IG_DS_USER_ID") or "").strip()
+    if ds_user_id:
+        cookies["ds_user_id"] = ds_user_id
+    csrftoken = (os.getenv("IG_CSRFTOKEN") or "").strip()
+    if csrftoken:
+        cookies["csrftoken"] = csrftoken
+    return cookies
+
+
 def _fetch_sync(username: str, max_posts: int) -> FetchResult:
     url = _WEB_PROFILE_INFO_URL.format(username=username)
     try:
         with httpx.Client(
             headers=_DEFAULT_HEADERS,
-            timeout=httpx.Timeout(15.0, connect=10.0),
+            cookies=_session_cookies(),
+            timeout=httpx.Timeout(60.0, connect=30.0),
             follow_redirects=True,
         ) as client:
             resp = client.get(url)

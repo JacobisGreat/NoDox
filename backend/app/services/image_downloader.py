@@ -7,11 +7,49 @@ larger than ``max_bytes`` to keep token spend and memory bounded.
 
 from __future__ import annotations
 
+from urllib.parse import urlparse
+
 import httpx
 
 
 class ImageDownloadError(RuntimeError):
     pass
+
+
+# Instagram's CDN hard-blocks fetches that don't look like the IG web client.
+# Sending a Chrome UA + Referer to instagram.com gets us through; without
+# them every cdninstagram.com / fbcdn.net request 403s and the geolocation
+# pipeline silently produces zero findings.
+_IG_CDN_HOST_SUFFIXES: tuple[str, ...] = (
+    "cdninstagram.com",
+    "fbcdn.net",
+)
+_IG_CDN_HEADERS: dict[str, str] = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Referer": "https://www.instagram.com/",
+    "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Sec-Fetch-Dest": "image",
+    "Sec-Fetch-Mode": "no-cors",
+    "Sec-Fetch-Site": "cross-site",
+}
+
+
+def _ig_cdn_headers_if_needed(url: str) -> dict[str, str] | None:
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except Exception:
+        return None
+    if not host:
+        return None
+    for suffix in _IG_CDN_HOST_SUFFIXES:
+        if host == suffix or host.endswith("." + suffix):
+            return _IG_CDN_HEADERS
+    return None
 
 
 class ImageDownloader:
@@ -35,10 +73,12 @@ class ImageDownloader:
         return "image/jpeg"
 
     async def download(self, url: str) -> tuple[bytes, str]:
+        request_headers = _ig_cdn_headers_if_needed(url)
         try:
             async with self._http.stream(
                 "GET",
                 url,
+                headers=request_headers,
                 timeout=httpx.Timeout(20.0, connect=10.0),
                 follow_redirects=True,
             ) as resp:
