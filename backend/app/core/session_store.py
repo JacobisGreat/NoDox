@@ -22,9 +22,26 @@ class SessionState:
     ig_user: dict[str, Any] | None = None
     media: list[dict[str, Any]] = field(default_factory=list)
     last_error: str | None = None
+    data: dict[str, Any] = field(default_factory=dict)
+    events: list[dict[str, Any]] = field(default_factory=list, repr=False)
+    event_condition: asyncio.Condition = field(default_factory=asyncio.Condition, repr=False)
+    state_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+    audit_tasks: dict[str, asyncio.Task[None]] = field(default_factory=dict, repr=False)
 
     def touch(self) -> None:
         self.updated_at = utcnow()
+
+    async def publish_event(self, event: dict[str, Any]) -> None:
+        async with self.event_condition:
+            self.events.append(event)
+            self.touch()
+            self.event_condition.notify_all()
+
+    async def wait_for_events(self, last_index: int, timeout_seconds: float = 15.0) -> None:
+        async with self.event_condition:
+            if len(self.events) > last_index:
+                return
+            await asyncio.wait_for(self.event_condition.wait(), timeout=timeout_seconds)
 
 
 class EphemeralSessionStore:
@@ -35,12 +52,8 @@ class EphemeralSessionStore:
 
     async def _cleanup_locked(self) -> None:
         now = utcnow()
-        expired_keys = [
-            key
-            for key, session in self._sessions.items()
-            if now - session.updated_at > self._ttl
-        ]
-        for key in expired_keys:
+        expired = [k for k, s in self._sessions.items() if now - s.updated_at > self._ttl]
+        for key in expired:
             del self._sessions[key]
 
     async def get_or_create(self, session_id: str | None = None) -> SessionState:
@@ -50,15 +63,13 @@ class EphemeralSessionStore:
                 session = self._sessions[session_id]
                 session.touch()
                 return session
-
-            new_session_id = secrets.token_urlsafe(32)
             now = utcnow()
             session = SessionState(
-                session_id=new_session_id,
+                session_id=secrets.token_urlsafe(32),
                 created_at=now,
                 updated_at=now,
             )
-            self._sessions[new_session_id] = session
+            self._sessions[session.session_id] = session
             return session
 
     async def get(self, session_id: str | None) -> SessionState | None:
@@ -83,4 +94,3 @@ class EphemeralSessionStore:
             return
         async with self._lock:
             self._sessions.pop(session_id, None)
-

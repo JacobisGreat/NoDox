@@ -3,3 +3,8 @@ uvicorn[standard]==0.34.2
 httpx==0.28.1
 pydantic==2.11.4
 pydantic-settings==2.9.1
+Pillow==11.2.1
+pyexiftool==0.5.6
+geoclip==1.2.0
+google-api-python-client==2.169.0
+trafilatura==1.12.2

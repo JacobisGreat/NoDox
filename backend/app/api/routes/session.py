@@ -1,9 +1,9 @@
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi import APIRouter, Depends, Request, Response
 
 from app.core.config import Settings, get_settings
 from app.core.dependencies import get_session_store
 from app.core.session_store import EphemeralSessionStore
-from app.schemas.auth import MediaGateResponse, SessionView
+from app.schemas.auth import SessionView
 
 router = APIRouter(tags=["session"])
 
@@ -32,33 +32,4 @@ async def get_session(
         value=session.session_id,
         **_cookie_kwargs(settings),
     )
-    return SessionView(
-        session_id=session.session_id,
-        auth_status=session.auth_status,
-        gate_passed=session.gate_passed,
-        ig_user=session.ig_user,
-        media_count=len(session.media),
-        last_error=session.last_error,
-    )
-
-
-@router.get("/me/media", response_model=MediaGateResponse)
-async def get_me_media(
-    request: Request,
-    settings: Settings = Depends(get_settings),
-    store: EphemeralSessionStore = Depends(get_session_store),
-) -> MediaGateResponse:
-    session_cookie = request.cookies.get(settings.session_cookie_name)
-    session = await store.get(session_cookie)
-    if not session:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="No active session. Complete OAuth first.",
-        )
-    if not session.gate_passed:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="OAuth gate not satisfied. /me/media has not completed successfully.",
-        )
-    return MediaGateResponse(gate_passed=True, media=session.media)
-
+    return SessionView(session_id=session.session_id)
