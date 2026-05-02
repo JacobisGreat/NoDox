@@ -127,7 +127,7 @@ _geoclip_predict_lock: Any = None  # threading.Lock — created lazily
 def _load_geoclip_sync() -> Any:
     """Synchronous loader. Always called under ``_geoclip_lock``.
 
-    Picks CUDA when available unless ``NODOX_GEOCLIP_DEVICE=cpu`` forces CPU.
+    Picks CUDA when available unless ``NODOXX_GEOCLIP_DEVICE=cpu`` forces CPU.
     """
     global _geoclip_model, _geoclip_load_attempted, _geoclip_load_error
     if _geoclip_model is not None or _geoclip_load_attempted:
@@ -138,7 +138,7 @@ def _load_geoclip_sync() -> Any:
 
         model = GeoCLIP()
         # GPU detection: opt-in via env, default to CUDA if available.
-        device_pref = os.environ.get("NODOX_GEOCLIP_DEVICE", "").lower()
+        device_pref = os.environ.get("NODOXX_GEOCLIP_DEVICE", "").lower()
         if device_pref == "cpu":
             target = "cpu"
         else:

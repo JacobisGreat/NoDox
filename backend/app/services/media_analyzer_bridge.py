@@ -120,7 +120,7 @@ class MediaAnalysis:
 # ---------------------------------------------------------------------------
 
 
-_DISABLED = os.environ.get("NODOX_MEDIA_ANALYZER_DISABLED", "").lower() in (
+_DISABLED = os.environ.get("NODOXX_MEDIA_ANALYZER_DISABLED", "").lower() in (
     "1",
     "true",
     "yes",

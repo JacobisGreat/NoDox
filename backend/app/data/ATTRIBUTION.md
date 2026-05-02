@@ -3,7 +3,7 @@
 `sherlock_data.json` is vendored verbatim from the **Sherlock** project's
 `sherlock_project/resources/data.json`. The loader at
 `backend/app/data/loader.py` normalizes Sherlock's schema into the shape
-NoDox's pipelines consume — no offline merge step is needed.
+NoDoxx's pipelines consume — no offline merge step is needed.
 
 - Sherlock — MIT license. Source:
   https://github.com/sherlock-project/sherlock

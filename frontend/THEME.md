@@ -1,4 +1,4 @@
-# THEME — NoDox B&W Kali Tokens
+# THEME — NoDoxx B&W Kali Tokens
 
 Strict palette. No other colors. No gradients. No glows. No drop shadows.
 

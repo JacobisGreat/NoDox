@@ -1,13 +1,13 @@
 # Identity Cross-Reference False Positives — Research & Fix Plan
 
 **Date:** 2026-05-02
-**Author:** NoDox engineering
+**Author:** NoDoxx engineering
 **Status:** Investigation complete; fix in progress
 
 ## TL;DR
 
 The Identity Cross-Reference column is producing findings whose URLs do not
-exist for the target user. Root cause: NoDox vendored Sherlock's
+exist for the target user. Root cause: NoDoxx vendored Sherlock's
 `data.json` (478 sites) and 321 of those sites use **status-code-only
 detection with no `errorCode` list** — i.e. "is the response 2xx?" That
 check is wrong on the modern web because:
@@ -23,7 +23,7 @@ requires a positive marker (`e_code` AND `e_string` in body) *and* the
 absence of the negative marker. Anything that matches neither side is
 inconclusive, not a hit.
 
-This single change kills the dominant FP class and aligns NoDox with what
+This single change kills the dominant FP class and aligns NoDoxx with what
 `systems/blackbird/` already does internally.
 
 ---
@@ -58,7 +58,7 @@ A platform is "claimed" when *every* declared `errorType` says so. For the
 collapses to: *did the server return any 2xx?* — which is the entire
 problem.
 
-### 1.2 Distribution of detection methods in NoDox's vendored data
+### 1.2 Distribution of detection methods in NoDoxx's vendored data
 
 ```
 total sites:                                     478
@@ -91,7 +91,7 @@ sees come from this class.
    captchas as a chronic source. Cloudflare's own
    [bot-score docs](https://developers.cloudflare.com/bots/concepts/bot-score/)
    confirm headless / non-browser clients are auto-flagged — exactly
-   NoDox's traffic profile.
+   NoDoxx's traffic profile.
 
 3. **`follow_redirects=True` masks "not found."** httpx defaults
    `follow_redirects=False` but our identity probe sets it `True`. Sites
@@ -103,7 +103,7 @@ sees come from this class.
    reports — issues #901, #959, #962, #1094, #1317, #1837, #2273, #2313,
    #2714, #2734, #2750, #2782, #2815, #2818 — most because sites silently
    changed routing or error markup. PR #2186 (Jun 2024) had to *remove*
-   Zhihu rather than fix it. NoDox's vendored copy ages every day it
+   Zhihu rather than fix it. NoDoxx's vendored copy ages every day it
    isn't refreshed.
 
 5. **Username collisions.** The Instagram-derived handle is one person on

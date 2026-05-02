@@ -93,7 +93,7 @@ def _coerce_int(value: Any, default: int = 0) -> int:
 
 def _normalize_template(template: str) -> str:
     """Convert WMN's ``{account}`` placeholder to ``{username}`` so
-    ``render_url`` can substitute uniformly with NoDox's other modules."""
+    ``render_url`` can substitute uniformly with NoDoxx's other modules."""
     if not template:
         return ""
     if "{username}" in template:

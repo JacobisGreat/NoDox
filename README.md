@@ -1,4 +1,4 @@
-# NoDox
+# NoDoxx
 
 Personal OSINT self-audit tool scaffold (Step 1 + Step 2 complete):
 
@@ -10,7 +10,7 @@ Personal OSINT self-audit tool scaffold (Step 1 + Step 2 complete):
 ## Folder Structure
 
 ```text
-NoDox/
+NoDoxx/
 ├── backend/
 │   ├── .env.example
 │   ├── requirements.txt

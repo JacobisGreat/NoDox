@@ -2,7 +2,7 @@
 pipelines.
 
 These deliberately avoid the heavy `media-analyzer` package — they do only
-what NoDox actually needs:
+what NoDoxx actually needs:
 
 * `reverse_geocode_coords(lat, lon)` — offline lookup, lat/lon → city/country
   via the `reverse-geocode` PyPI package (~1MB data shipped with the package).
