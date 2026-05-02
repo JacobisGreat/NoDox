@@ -88,26 +88,32 @@ async def _check_one(
     http: httpx.AsyncClient,
     sem: asyncio.Semaphore,
 ) -> ProbeHit | None:
+    """WhatsMyName two-sided account probe.
+
+    Skips POST sites and WAF/CAPTCHA-fronted sites. A "found" verdict
+    requires both the e_code/e_string positive marker AND the absence of
+    the m_string negative marker. See ``IDENTITY_FALSE_POSITIVES.md``.
+    """
     name = platform["name"]
+    method = platform.get("method", "GET").upper()
+    if method != "GET":
+        return None  # POST sites handled by the identity pipeline
+    if platform.get("protected"):
+        return None
+
     url = render_url(platform["url_template"], username)
     probe_url = render_url(
         platform.get("probe_template") or platform["url_template"], username
-    )
-    method = platform.get("method", "GET").upper()
-    error_types: list[str] = platform.get("error_types", ["status_code"])
-    error_messages: list[str] = platform.get("error_messages", [])
-    error_codes: list[int] = platform.get("error_codes", [])
-    error_url_rendered = render_url(
-        platform.get("error_url_template", ""), username
     )
     site_headers: dict[str, str] = platform.get("headers", {}) or {}
     regex_check = platform.get("regex_check")
     category = platform.get("category", "other")
 
-    # Skip POST sites in the lightweight probe — they need payload rendering
-    # which the identity pipeline already handles.
-    if method != "GET":
-        return None
+    e_code = int(platform.get("e_code") or 0)
+    e_string = platform.get("e_string") or ""
+    m_code = int(platform.get("m_code") or 0)
+    m_string = platform.get("m_string") or ""
+    have_two_sided = e_code > 0 and e_string and m_code > 0 and m_string
 
     if regex_check:
         try:
@@ -119,36 +125,47 @@ async def _check_one(
     merged_headers = {**_HEADERS, **site_headers}
     async with sem:
         try:
+            # Redirects off: a 30x to a sign-in/homepage masks "user not
+            # found" and is a major FP source.
             resp = await http.get(
                 probe_url,
                 headers=merged_headers,
                 timeout=_REQUEST_TIMEOUT,
-                follow_redirects=True,
+                follow_redirects=False,
             )
         except (httpx.HTTPError, asyncio.TimeoutError):
             return None
         except Exception:
             return None
 
+        try:
+            body = resp.text or ""
+        except Exception:
+            return None
+
+    body_for_match = body[:_BODY_SCAN_BYTES * 4]  # generous match window
+
+    if have_two_sided:
+        e_match = (resp.status_code == e_code) and (e_string in body_for_match)
+        m_match = (resp.status_code == m_code) and (m_string in body_for_match)
+        if not e_match or m_match:
+            return None
+    else:
+        # Sherlock-style fallback (kept for catalogs lacking WMN markers):
+        error_types: list[str] = platform.get("error_types", ["status_code"])
+        error_messages: list[str] = platform.get("error_messages", [])
+        error_codes: list[int] = platform.get("error_codes", [])
         if "status_code" in error_types:
             codes = error_codes or [404]
             if resp.status_code in codes:
                 return None
             if resp.status_code >= 400 and resp.status_code not in (200, 201, 202):
                 return None
-        if "response_url" in error_types and error_url_rendered:
-            if str(resp.url).rstrip("/") == error_url_rendered.rstrip("/"):
-                return None
-        try:
-            body = resp.text or ""
-        except Exception:
-            return None
-
-    if "message" in error_types and error_messages:
-        snippet = body[:_BODY_SCAN_BYTES].lower()
-        for needle in error_messages:
-            if needle and needle.lower() in snippet:
-                return None
+        if "message" in error_types and error_messages:
+            snippet = body_for_match.lower()
+            for needle in error_messages:
+                if needle and needle.lower() in snippet:
+                    return None
 
     risk = "HIGH" if _is_high_risk(name, category) else "MEDIUM"
     return ProbeHit(site=name, url=url, category=category, risk_level=risk)

@@ -93,6 +93,20 @@ _WAF_FINGERPRINTS: tuple[str, ...] = (
     "Just a moment...",
     "cf-browser-verification",
     "captcha-bypass",
+    # 2024-2026 additions — see IDENTITY_FALSE_POSITIVES.md
+    "challenges.cloudflare.com/turnstile",
+    "/cdn-cgi/challenge-platform/",
+    "cf-mitigated",
+    "awswaf.com",
+    "awswaf-token",
+    "_pxhd",
+    "px-captcha",
+    'data-pxht="captcha"',
+    "geo.captcha-delivery.com",
+    "x-dd-b",
+    "_abck",
+    "ak_bmsc",
+    "g-recaptcha",
 )
 
 # Page-level error/landing fingerprints. A site can return 200 (so
@@ -362,12 +376,34 @@ def _is_claimed(
     status_code: int,
     body_for_match: str,
 ) -> bool:
-    """Apply Sherlock's matching to decide if the username is claimed.
+    """Decide whether a probe response indicates the username is claimed.
 
-    Returns True iff *every* declared errorType says "claimed". As soon
-    as one says "available", we bail. (Sherlock's effective semantics:
-    once AVAILABLE is set, later checks don't override.)
+    Two paths:
+
+    **WMN two-sided** (when the loader supplies ``e_code``/``e_string``/
+    ``m_code``/``m_string``):
+        FOUND iff  e_code == status AND e_string IN body
+                   AND NOT (m_code == status AND m_string IN body)
+        Anything else → inconclusive, return False.
+
+    **Sherlock 3-mode fallback** (current loader): apply
+    status_code/message/response_url. The body-level "user not found"
+    veto runs at the call-site (``_looks_like_not_found``) which catches
+    the soft-200 SPA class that this matcher otherwise misses.
+
+    See ``IDENTITY_FALSE_POSITIVES.md`` for full rationale.
     """
+    # ---- WMN two-sided when loader exposes positive markers ----
+    e_code = int(platform.get("e_code") or 0)
+    e_string = platform.get("e_string") or ""
+    m_code = int(platform.get("m_code") or 0)
+    m_string = platform.get("m_string") or ""
+    if e_code > 0 and e_string and m_code > 0 and m_string:
+        e_match = (status_code == e_code) and (e_string in body_for_match)
+        m_match = (status_code == m_code) and (m_string in body_for_match)
+        return bool(e_match and not m_match)
+
+    # ---- Sherlock 3-mode fallback ----
     error_types: list[str] = list(platform.get("error_types") or [])
     if not error_types:
         error_types = ["status_code"]
@@ -376,7 +412,7 @@ def _is_claimed(
         if et == "message":
             messages: list[str] = platform.get("error_messages") or []
             if any(msg and msg in body_for_match for msg in messages):
-                return False  # error string present → user not found
+                return False
         elif et == "status_code":
             error_codes: list[int] = platform.get("error_codes") or []
             if error_codes:
@@ -385,9 +421,6 @@ def _is_claimed(
             elif not (200 <= status_code < 300):
                 return False
         elif et == "response_url":
-            # Caller turned redirects OFF for response_url sites. A non-2xx
-            # response (typically a 30x to the error page) means the user
-            # doesn't exist.
             if not (200 <= status_code < 300):
                 return False
         else:
@@ -416,6 +449,13 @@ async def _check_platform(
 ) -> Finding | None:
     name: str = platform["name"]
 
+    # WMN-style ``protected`` flag (set when the catalog ships it) — these
+    # sites are WAF/CAPTCHA-fronted and probing them produces high-FP
+    # results we can't validate. Sherlock data doesn't carry the flag, so
+    # this is a no-op there; runtime WAF detection still catches them.
+    if platform.get("protected"):
+        return None
+
     # Per-site username regex — skip without ever issuing a request.
     regex_check = platform.get("regex_check")
     if regex_check:
@@ -425,9 +465,10 @@ async def _check_platform(
         except re.error:
             pass
 
-    # response_url sites need redirects disabled — see Sherlock semantics.
-    error_types: list[str] = list(platform.get("error_types") or ["status_code"])
-    follow_redirects = "response_url" not in error_types
+    # Two-sided detection makes follow_redirects irrelevant for the body
+    # match (we look for e_string explicitly), but a 30x to a login wall
+    # or homepage still poisons the verdict. Disable redirects globally.
+    follow_redirects = False
 
     method = (platform.get("method") or "GET").upper()
     probe_url = render_url(platform["probe_template"], username)
@@ -602,7 +643,7 @@ async def _check_platform(
             round(bio_similarity, 3) if bio_similarity is not None else None
         ),
         "display_name": display_name or None,
-        "detection": "+".join(error_types),
+        "detection": "+".join(platform.get("error_types") or []) or "wmn_two_sided",
         "nsfw": bool(platform.get("nsfw", False)),
     }
 

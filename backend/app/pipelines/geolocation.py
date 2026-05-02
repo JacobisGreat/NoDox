@@ -31,6 +31,7 @@ from app.schemas.events import (
     pipeline_status as _pipeline_status_event,
 )
 from app.schemas.findings import Finding
+from app.services.geocode_text import GeocodeHit, geocode_text
 from app.services.media_enrichment import reverse_geocode_coords
 from app.session_store import SessionState
 
@@ -300,6 +301,30 @@ async def _emit_finding(session: SessionState, finding: Finding) -> None:
     await session.publish_event(_finding_event(_PIPELINE, payload))
 
 
+async def _geocode_first(*texts: str | None) -> GeocodeHit | None:
+    """Return the first resolved geocode hit across ``texts``, in order."""
+    for raw in texts:
+        if not raw:
+            continue
+        hit = await geocode_text(raw)
+        if hit is not None:
+            return hit
+    return None
+
+
+def _attach_geocode_metadata(metadata: dict[str, Any], hit: GeocodeHit) -> None:
+    """Attach lat/lon (and city/country if absent) to a finding's metadata."""
+    metadata.setdefault("lat", hit.lat)
+    metadata.setdefault("lon", hit.lon)
+    if hit.country and "country" not in metadata:
+        metadata["country"] = hit.country
+    if hit.kind == "city" and "city" not in metadata:
+        metadata["city"] = hit.name
+    metadata.setdefault("geocoded_via", hit.method)
+    metadata.setdefault("geocoded_match", hit.name)
+    metadata.setdefault("geocode_confidence", hit.confidence)
+
+
 async def _emit_cost(session: SessionState) -> None:
     tracker = session.data.get("cost_tracker")
     if tracker is None:
@@ -321,12 +346,25 @@ async def _process_location_tag(session: SessionState, post: dict) -> dict | Non
     if not location_name:
         return None
     shortcode = post.get("shortcode") or "unknown"
+    metadata: dict[str, Any] = {
+        "location_name": location_name,
+        "location_id": post.get("location_id"),
+        "shortcode": shortcode,
+    }
+    hit = await _geocode_first(location_name)
+    if hit is not None:
+        _attach_geocode_metadata(metadata, hit)
     finding = Finding(
         source="instagram_location_tag",
         evidence_chain=[
             f"Post: {_shortcode_url(shortcode)}",
             f"Instagram location tag: {location_name}",
-        ],
+        ]
+        + (
+            [f"Geocoded to: {hit.name}, {hit.country} ({hit.lat:.4f}, {hit.lon:.4f})"]
+            if hit is not None
+            else []
+        ),
         confidence=0.85,
         risk_level="HIGH",
         remediation=(
@@ -334,20 +372,20 @@ async def _process_location_tag(session: SessionState, post: dict) -> dict | Non
             f"{_shortcode_url(shortcode)}, and remove the tagged location. "
             "Going forward, disable location tagging in Settings > Privacy."
         ),
-        metadata={
-            "location_name": location_name,
-            "location_id": post.get("location_id"),
-            "shortcode": shortcode,
-        },
+        metadata=metadata,
     )
     await _emit_finding(session, finding)
-    return {
+    signal: dict[str, Any] = {
         "type": "instagram_location_tag",
         "description": location_name,
         "location_hint": location_name,
         "confidence": 0.85,
         "shortcode": shortcode,
     }
+    if hit is not None:
+        signal["lat"] = hit.lat
+        signal["lon"] = hit.lon
+    return signal
 
 
 async def _process_vlm(
@@ -429,14 +467,32 @@ async def _process_vlm(
     # the aggregator's job, but a confident landmark is worth surfacing now.
     for sig in signals:
         if sig["confidence"] >= 0.75 and sig["location_hint"]:
+            metadata: dict[str, Any] = {
+                "shortcode": shortcode,
+                "signal_type": sig["type"],
+                "location_hint": sig["location_hint"],
+            }
+            hit = await _geocode_first(
+                sig["location_hint"], sig.get("best_guess_region")
+            )
+            if hit is not None:
+                _attach_geocode_metadata(metadata, hit)
+                sig["lat"] = hit.lat
+                sig["lon"] = hit.lon
+            evidence = [
+                f"Post: {_shortcode_url(shortcode)}",
+                f"Visual signal: {sig['type']}",
+                f"Description: {sig['description']}",
+                f"Hint: {sig['location_hint']}",
+            ]
+            if hit is not None:
+                evidence.append(
+                    f"Geocoded to: {hit.name}, {hit.country} "
+                    f"({hit.lat:.4f}, {hit.lon:.4f})"
+                )
             finding = Finding(
                 source="vlm_landmark",
-                evidence_chain=[
-                    f"Post: {_shortcode_url(shortcode)}",
-                    f"Visual signal: {sig['type']}",
-                    f"Description: {sig['description']}",
-                    f"Hint: {sig['location_hint']}",
-                ],
+                evidence_chain=evidence,
                 confidence=min(0.8, sig["confidence"]),
                 risk_level="MEDIUM",
                 remediation=(
@@ -444,11 +500,7 @@ async def _process_vlm(
                     f"image visibly reveals {sig['location_hint']}. Crop or "
                     "remove identifying scenery, or delete the post."
                 ),
-                metadata={
-                    "shortcode": shortcode,
-                    "signal_type": sig["type"],
-                    "location_hint": sig["location_hint"],
-                },
+                metadata=metadata,
             )
             await _emit_finding(session, finding)
 
@@ -686,6 +738,21 @@ async def _run_aggregation(
             f"Cluster confidence: {confidence:.2f}",
         ] + [f"Evidence: {line}" for line in evidence_lines]
 
+        metadata: dict[str, Any] = {
+            "region": region,
+            "evidence": evidence_lines,
+            "cluster_confidence": confidence,
+        }
+        # Geocode the region (and fall back to scanning evidence lines) so the
+        # cluster lands on the map.
+        hit = await _geocode_first(region, *evidence_lines)
+        if hit is not None:
+            _attach_geocode_metadata(metadata, hit)
+            evidence_chain.append(
+                f"Geocoded to: {hit.name}, {hit.country} "
+                f"({hit.lat:.4f}, {hit.lon:.4f})"
+            )
+
         finding = Finding(
             source="geo_aggregation",
             evidence_chain=evidence_chain,
@@ -696,11 +763,7 @@ async def _run_aggregation(
                 "for tagged locations, recognizable backgrounds, and EXIF "
                 "metadata; remove or crop content that pinpoints this area."
             ),
-            metadata={
-                "region": region,
-                "evidence": evidence_lines,
-                "cluster_confidence": confidence,
-            },
+            metadata=metadata,
         )
         await _emit_finding(session, finding)
 
