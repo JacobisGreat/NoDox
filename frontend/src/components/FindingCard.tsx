@@ -11,19 +11,54 @@ interface Props {
   finding: Finding;
 }
 
+// Pre-attentive severity encoding inside a B&W constraint. Brightness alone
+// (a single channel) doesn't make HIGH/CRITICAL pop in a scrolling list, so
+// we widen the encoding across border-thickness, surface-tint, and source-
+// label brightness. Treisman's pre-attentive feature theory: the eye locks
+// onto the thicker bar + brighter surface in <200ms without reading.
+const SEVERITY_TREATMENT: Record<
+  Finding["risk_level"],
+  { borderWidth: number; panelClass: string; sourceClass: string }
+> = {
+  LOW: {
+    borderWidth: 2,
+    panelClass: "border border-nodoxx-border bg-nodoxx-panel2",
+    sourceClass: "text-nodoxx-muted",
+  },
+  MEDIUM: {
+    borderWidth: 3,
+    panelClass: "border border-nodoxx-border bg-nodoxx-panel2",
+    sourceClass: "text-nodoxx-muted",
+  },
+  HIGH: {
+    borderWidth: 4,
+    panelClass: "border border-nodoxx-border bg-white/[0.03]",
+    sourceClass: "text-nodoxx-text",
+  },
+  CRITICAL: {
+    borderWidth: 5,
+    panelClass: "border border-nodoxx-text/40 bg-white/[0.05]",
+    sourceClass: "text-nodoxx-text",
+  },
+};
+
 export default function FindingCard({ finding }: Props) {
   const borderColor = riskBorderColor(finding.risk_level);
   const confColor = confidenceColor(finding.confidence);
   const confidencePct = Math.max(0, Math.min(1, finding.confidence)) * 100;
+  const treat =
+    SEVERITY_TREATMENT[finding.risk_level] ?? SEVERITY_TREATMENT.MEDIUM;
 
   return (
     <article
-      className="animate-card-in border border-nodoxx-border bg-nodoxx-panel2"
-      style={{ borderLeft: `3px solid ${borderColor}` }}
+      className={`animate-card-in ${treat.panelClass}`}
+      style={{ borderLeft: `${treat.borderWidth}px solid ${borderColor}` }}
     >
       <div className="space-y-3 p-4">
         <header className="flex items-start justify-between gap-3">
-          <span className="font-mono text-[11px] uppercase tracking-[0.18em] text-nodoxx-muted">
+          <span
+            className={`font-mono text-[11px] font-semibold uppercase tracking-[0.18em] ${treat.sourceClass}`}
+          >
             // {finding.source}
           </span>
           <span

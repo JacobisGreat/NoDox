@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import LandingPage from "./components/LandingPage";
 import AuditDashboard from "./components/AuditDashboard";
+import MatrixRain from "./components/MatrixRain";
 
 const AUDIT_PATH_REGEX = /^\/audit\/([A-Za-z0-9_-]+)\/?$/;
 
@@ -17,7 +18,9 @@ function parseRoute(pathname: string): Route {
 }
 
 export default function App() {
-  const [route, setRoute] = useState<Route>(() => parseRoute(window.location.pathname));
+  const [route, setRoute] = useState<Route>(() =>
+    parseRoute(window.location.pathname),
+  );
 
   useEffect(() => {
     const current = parseRoute(window.location.pathname);
@@ -35,8 +38,16 @@ export default function App() {
     return () => window.removeEventListener("popstate", onPop);
   }, []);
 
-  if (route.name === "audit" && route.sessionId) {
-    return <AuditDashboard sessionId={route.sessionId} />;
-  }
-  return <LandingPage />;
+  return (
+    <>
+      <MatrixRain />
+      <div className="relative z-10">
+        {route.name === "audit" && route.sessionId ? (
+          <AuditDashboard sessionId={route.sessionId} />
+        ) : (
+          <LandingPage />
+        )}
+      </div>
+    </>
+  );
 }

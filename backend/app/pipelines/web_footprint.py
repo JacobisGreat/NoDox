@@ -31,6 +31,7 @@ from app.services import emailrep as _emailrep
 from app.services import github_lookup as _github_lookup
 from app.services import gravatar as _gravatar
 from app.services import intelbase as _intelbase
+from app.services import linkedin_snippet as _linkedin_snippet
 from app.services import searchcode as _searchcode
 from app.services import spiderfoot_catalog as _sf_catalog
 from app.services import wayback as _wayback
@@ -935,16 +936,28 @@ async def _run_email_permutator(
     profile: dict,
     username: str,
     seen_emails: set[str],
+    extra_domain_hints: tuple[str, ...] = (),
 ) -> None:
     """Generate likely emails from full_name × common providers, then
     confirm each by probing Gravatar (free, fast). Confirmed emails get
     added to ``seen_emails`` so downstream pivots cross-reference them.
+
+    ``extra_domain_hints`` are domains the caller has independently
+    surfaced (e.g. an employer name from a LinkedIn snippet → guessed
+    ``employer.com``). They go to the front of the candidate list
+    because work emails on a target's actual employer domain are the
+    highest-value find.
     """
     full_name = str(profile.get("full_name", "") or "")
     if not full_name:
         return
 
-    extra: tuple[str, ...] = ()
+    extra_list: list[str] = []
+    for h in extra_domain_hints:
+        h_clean = (h or "").strip().lower()
+        if h_clean and "." in h_clean and h_clean not in extra_list:
+            extra_list.append(h_clean)
+
     ext_url = str(profile.get("external_url", "") or "")
     domain = _email_permutator.domain_from_url(ext_url)
     if domain and "." in domain and domain not in (
@@ -953,8 +966,10 @@ async def _run_email_permutator(
         "linktree.com",
         "beacons.ai",
         "bio.link",
-    ):
-        extra = (domain,)
+    ) and domain not in extra_list:
+        extra_list.append(domain)
+
+    extra: tuple[str, ...] = tuple(extra_list)
 
     candidates = _email_permutator.generate_candidates(
         full_name=full_name,
@@ -1127,6 +1142,109 @@ async def _run_wayback_pivot(
 
         for e in new_for_url:
             seen_emails.add(e)
+
+
+async def _run_linkedin_snippet_harvest(
+    session: SessionState,
+    cse: SerperClient,
+    full_name: str,
+    username: str,
+    city_hint: str,
+) -> list:
+    """Run LinkedIn-targeted dorks and parse the search snippets into
+    structured fields. We never fetch LinkedIn HTML directly — Google's
+    snippet is the only logged-out view of the public profile body.
+
+    Each parsed profile becomes a finding. Returns the parsed snippets
+    so the caller can fold employer/school/location hints back into
+    other pivots (e.g. employer domain → email permutator).
+    """
+    if not full_name and not username:
+        return []
+
+    try:
+        snippets = await _linkedin_snippet.harvest(
+            cse,
+            full_name=full_name,
+            username=username,
+            city_hint=city_hint,
+            max_queries=4,
+            max_per_query=8,
+        )
+    except Exception:
+        return []
+    if not snippets:
+        return []
+
+    findings_log: list[dict] = session.data.setdefault("findings", [])
+
+    for snip in snippets:
+        evidence_chain = [
+            f"LinkedIn profile: {snip.profile_url}",
+            "Source: Google search snippet (LinkedIn HTML is gated logged-out)",
+        ]
+        if snip.name:
+            evidence_chain.append(f"Name: {snip.name}")
+        if snip.headline_company:
+            evidence_chain.append(f"Headline company: {snip.headline_company}")
+        if snip.employer:
+            evidence_chain.append(f"Experience: {snip.employer}")
+        if snip.school:
+            evidence_chain.append(f"Education: {snip.school}")
+        loc_parts = [p for p in (snip.city, snip.region, snip.country) if p]
+        if loc_parts:
+            evidence_chain.append(f"Location: {', '.join(loc_parts)}")
+        if snip.postal_code:
+            evidence_chain.append(f"Postal code: {snip.postal_code}")
+        if snip.headline:
+            evidence_chain.append(f"Headline: {snip.headline[:200]}")
+        if snip.followers:
+            evidence_chain.append(f"Followers: {snip.followers}")
+        if snip.connections:
+            evidence_chain.append(f"Connections: {snip.connections}")
+
+        # Postal-code or precise city/employer pairing is HIGH because it
+        # narrows the target's home/work neighborhood. School-only is
+        # MEDIUM.
+        risk = "HIGH" if (snip.postal_code or (snip.city and snip.employer)) else "MEDIUM"
+
+        finding = Finding(
+            source="linkedin_snippet",
+            evidence_chain=evidence_chain,
+            confidence=0.85,
+            risk_level=risk,  # type: ignore[arg-type]
+            remediation=(
+                f"Tighten LinkedIn profile visibility at {snip.profile_url}. "
+                "Settings → Visibility → 'Edit your public profile' lets you "
+                "hide each field (location, employer, education, "
+                "headline) from logged-out viewers and search engines. "
+                "Fields you don't hide are scraped into Google snippets "
+                "and end up in dossiers like this one."
+            ),
+            metadata={
+                "profile_url": snip.profile_url,
+                "name": snip.name,
+                "employer": snip.employer,
+                "headline_company": snip.headline_company,
+                "school": snip.school,
+                "city": snip.city,
+                "region": snip.region,
+                "country": snip.country,
+                "postal_code": snip.postal_code,
+                "headline": snip.headline,
+                "followers": snip.followers,
+                "connections": snip.connections,
+                "raw_title": snip.title,
+                "raw_snippet": snip.snippet,
+            },
+        )
+        payload = finding.to_dict()
+        tagged = dict(payload)
+        tagged["_pipeline"] = _PIPELINE
+        findings_log.append(tagged)
+        await session.publish_event(_finding_event(_PIPELINE, payload))
+
+    return snippets
 
 
 async def _run_emailrep_pivot(
@@ -1423,10 +1541,37 @@ async def run(session: SessionState) -> None:
         #    leakage for any developer target.
         await _run_github_lookup(session, http, username, seen_emails)
 
-        # 2. Email permutator (free) — generate name-based candidates and
+        # 2. LinkedIn snippet harvest — Google snippets for LinkedIn
+        #    profiles expose employer, education, city, postal code,
+        #    follower count *without* fetching the gated LinkedIn HTML.
+        #    Run before the permutator so the discovered employer
+        #    domain can seed extra email candidates.
+        li_snippets = await _run_linkedin_snippet_harvest(
+            session, cse, full_name, username, city_hint=""
+        )
+        # Build extra email-domain hints from any discovered employers.
+        permutator_extra_domains: list[str] = []
+        for snip in li_snippets:
+            for emp in (snip.employer, snip.headline_company):
+                if not emp:
+                    continue
+                # "Geotab" -> "geotab.com" guess. Crude but correct
+                # often enough that the Gravatar probe is worth a try.
+                slug = _re.sub(r"[^a-z0-9]+", "", emp.lower())
+                if slug and len(slug) >= 3:
+                    permutator_extra_domains.append(f"{slug}.com")
+
+        # 3. Email permutator (free) — generate name-based candidates and
         #    confirm them via Gravatar. Confirmed candidates flow into
         #    seen_emails for the rest of the cross-reference loop.
-        await _run_email_permutator(session, http, profile, username, seen_emails)
+        await _run_email_permutator(
+            session,
+            http,
+            profile,
+            username,
+            seen_emails,
+            extra_domain_hints=tuple(permutator_extra_domains),
+        )
 
         # 3. Wayback Machine (free) — pull archived snapshots of any
         #    LinkedIn / FB / X / Quora / Medium URLs surfaced during
