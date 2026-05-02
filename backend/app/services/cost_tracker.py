@@ -17,43 +17,43 @@ class CostTracker:
         self,
         global_ceiling_usd: float,
         scope_budgets: dict[str, float] | None = None,
-        sonnet_in: float = 3.0,
-        sonnet_out: float = 15.0,
-        haiku_in: float = 1.0,
-        haiku_out: float = 5.0,
-        sonnet_model_id: str = "",
-        haiku_model_id: str = "",
+        pro_in: float = 1.25,
+        pro_out: float = 10.0,
+        fast_in: float = 0.30,
+        fast_out: float = 2.50,
+        pro_model_id: str = "",
+        fast_model_id: str = "",
     ) -> None:
         self._global_ceiling = float(global_ceiling_usd)
         self._scope_budgets: dict[str, float] = dict(scope_budgets or {})
-        self._sonnet_in = float(sonnet_in)
-        self._sonnet_out = float(sonnet_out)
-        self._haiku_in = float(haiku_in)
-        self._haiku_out = float(haiku_out)
-        self._sonnet_id = sonnet_model_id
-        self._haiku_id = haiku_model_id
+        self._pro_in = float(pro_in)
+        self._pro_out = float(pro_out)
+        self._fast_in = float(fast_in)
+        self._fast_out = float(fast_out)
+        self._pro_id = pro_model_id
+        self._fast_id = fast_model_id
 
         self._totals: dict[str, float] = defaultdict(float)
         self._totals["global"] = 0.0
         self._external: list[dict[str, Any]] = []
-        self._anthropic_calls: list[dict[str, Any]] = []
+        self._llm_calls: list[dict[str, Any]] = []
 
     # --- pricing -------------------------------------------------------
 
     def _prices_for(self, model: str) -> tuple[float, float]:
         # Match by exact id first, then by family substring as a fallback
         # so renamed model snapshots still get sensible pricing.
-        if model and self._sonnet_id and model == self._sonnet_id:
-            return self._sonnet_in, self._sonnet_out
-        if model and self._haiku_id and model == self._haiku_id:
-            return self._haiku_in, self._haiku_out
+        if model and self._pro_id and model == self._pro_id:
+            return self._pro_in, self._pro_out
+        if model and self._fast_id and model == self._fast_id:
+            return self._fast_in, self._fast_out
         lowered = (model or "").lower()
-        if "sonnet" in lowered:
-            return self._sonnet_in, self._sonnet_out
-        if "haiku" in lowered:
-            return self._haiku_in, self._haiku_out
-        # Unknown model — assume sonnet pricing (more conservative).
-        return self._sonnet_in, self._sonnet_out
+        if "pro" in lowered:
+            return self._pro_in, self._pro_out
+        if "flash" in lowered or "fast" in lowered or "haiku" in lowered:
+            return self._fast_in, self._fast_out
+        # Unknown model — assume pro pricing (more conservative).
+        return self._pro_in, self._pro_out
 
     @staticmethod
     def _compute(
@@ -69,7 +69,7 @@ class CostTracker:
 
     # --- recording -----------------------------------------------------
 
-    def record_anthropic(self, usage: dict, scope: str = "global") -> float:
+    def record_llm(self, usage: dict, scope: str = "global") -> float:
         model = usage.get("model", "") or ""
         in_price, out_price = self._prices_for(model)
         delta = self._compute(
@@ -81,7 +81,7 @@ class CostTracker:
         self._totals["global"] += delta
         if scope and scope != "global":
             self._totals[scope] += delta
-        self._anthropic_calls.append(
+        self._llm_calls.append(
             {
                 "model": model,
                 "scope": scope,
@@ -91,6 +91,9 @@ class CostTracker:
             }
         )
         return delta
+
+    # Back-compat alias — old call sites use record_anthropic.
+    record_anthropic = record_llm
 
     def record_external(
         self, service: str, cost_usd: float, scope: str = "global"
@@ -132,6 +135,6 @@ class CostTracker:
             "remaining_usd": self.remaining("global"),
             "scope_totals": {k: v for k, v in self._totals.items() if k != "global"},
             "scope_budgets": dict(self._scope_budgets),
-            "anthropic_calls": list(self._anthropic_calls),
+            "llm_calls": list(self._llm_calls),
             "external_calls": list(self._external),
         }

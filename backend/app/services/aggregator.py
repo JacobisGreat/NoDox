@@ -201,8 +201,8 @@ async def run(session: SessionState) -> None:
         )
         return
 
-    if not settings.anthropic_api_key:
-        report = _fallback_report(findings, "ANTHROPIC_API_KEY not configured")
+    if not settings.gemini_api_key:
+        report = _fallback_report(findings, "GEMINI_API_KEY not configured")
         await session.publish_event(
             _aggregator_done_event(
                 report["exposure_score"], report["summary"], report["remediation_list"]
@@ -213,7 +213,7 @@ async def run(session: SessionState) -> None:
     cost_tracker = session.data.get("cost_tracker")
     anthropic = session.data.get("anthropic")
     if anthropic is None:
-        report = _fallback_report(findings, "Anthropic client unavailable")
+        report = _fallback_report(findings, "Gemini client unavailable")
         await session.publish_event(
             _aggregator_done_event(
                 report["exposure_score"], report["summary"], report["remediation_list"]
@@ -240,7 +240,7 @@ async def run(session: SessionState) -> None:
         if sem is not None:
             async with sem:
                 text, usage = await anthropic.call_text(
-                    model=settings.anthropic_sonnet_model,
+                    model=settings.gemini_pro_model,
                     system=_SYSTEM_PROMPT,
                     user_content=user_prompt,
                     max_tokens=4096,
@@ -248,7 +248,7 @@ async def run(session: SessionState) -> None:
                 )
         else:
             text, usage = await anthropic.call_text(
-                model=settings.anthropic_sonnet_model,
+                model=settings.gemini_pro_model,
                 system=_SYSTEM_PROMPT,
                 user_content=user_prompt,
                 max_tokens=4096,

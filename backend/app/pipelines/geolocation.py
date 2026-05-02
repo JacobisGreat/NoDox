@@ -1,14 +1,18 @@
 """Geolocation pipeline.
 
 Looks at every public post image and tries to figure out where it was
-taken. Four signal channels feed an aggregator:
+taken. Five signal channels feed an aggregator:
 
 1. EXIF GPS — the highest-confidence channel, when present at all.
 2. Instagram location tag — the user explicitly tagged the spot.
 3. VLM analysis — Haiku scans the image for street signs, transit
    logos, license plates, vegetation, architectural style, etc.
-4. GeoCLIP — a CLIP-based embedding model that predicts GPS coords
-   directly from pixels.
+4. GeoCLIP — a CLIP-based embedding model (vendored under
+   ``systems/geo-clip``) that predicts GPS coords directly from pixels.
+5. media-analyzer — vendored ``systems/media-analyzer`` package; runs
+   ResNet-gated Tesseract OCR plus DETR object detection, geocodes any
+   locatable text via the embedding-based geocoder, and surfaces
+   locale-specific object labels as corroborating signal.
 
 Per-image findings are emitted the moment they're discovered so the
 dashboard streams in real time. Once enough signals accumulate, Sonnet
@@ -32,6 +36,10 @@ from app.schemas.events import (
 )
 from app.schemas.findings import Finding
 from app.services.geocode_text import GeocodeHit, geocode_text
+from app.services.media_analyzer_bridge import (
+    MediaAnalysis,
+    analyze_image_for_location as _media_analyzer_analyze,
+)
 from app.services.media_enrichment import reverse_geocode_coords
 from app.session_store import SessionState
 
@@ -49,6 +57,17 @@ _MIN_SIGNALS_FOR_AGGREGATION = 3
 _GEOCLIP_MIN_CONFIDENCE = 0.10
 _GEOCLIP_FINDING_THRESHOLD = 0.20
 _CLUSTER_EMIT_THRESHOLD = 0.40
+
+# Signal categories. Image-based scanning is the primary evidence channel —
+# the centroid and aggregator decision should be driven by these. Instagram
+# tags are downgraded to corroboration only: they refine or verify an
+# image-derived cluster but are not enough on their own to claim a region
+# at high confidence. When image scanning yields nothing usable, tags are
+# surfaced as an explicit "fallback estimate".
+_CAT_IMAGE_PRIMARY = "image_primary"  # EXIF GPS, GeoCLIP top prediction
+_CAT_IMAGE_SECONDARY = "image_secondary"  # VLM landmark, OCR text, objects
+_CAT_TAG = "tag"  # Instagram location tag (corroboration, not primary)
+_IMAGE_CATEGORIES = {_CAT_IMAGE_PRIMARY, _CAT_IMAGE_SECONDARY}
 
 # Rough cost estimates used for budget-gating before each call.
 _HAIKU_VISION_COST_GUESS = 0.01
@@ -399,7 +418,7 @@ async def _process_vlm(
     anthropic = session.data.get("anthropic")
     sem: asyncio.Semaphore | None = session.data.get("vision_semaphore")
 
-    if anthropic is None or not settings.anthropic_api_key:
+    if anthropic is None or not settings.gemini_api_key:
         return []
     if cost_tracker is not None and not cost_tracker.can_spend(
         _HAIKU_VISION_COST_GUESS
@@ -411,7 +430,7 @@ async def _process_vlm(
     async def _call() -> tuple[str, dict] | None:
         try:
             return await anthropic.call_vision(
-                model=settings.anthropic_haiku_model,
+                model=settings.gemini_fast_model,
                 system=_VLM_SYSTEM_PROMPT,
                 image_bytes=image_bytes,
                 image_media_type=media_type,
@@ -580,6 +599,136 @@ async def _process_geoclip(
     return relevant
 
 
+# Object labels that suggest locale-specific signal. Used to classify
+# whether a DETR detection is worth surfacing as evidence.
+_LOCATION_HINT_OBJECTS: set[str] = {
+    "bus",
+    "train",
+    "tram",
+    "subway",
+    "taxi",
+    "license plate",
+    "stop sign",
+    "traffic light",
+    "fire hydrant",
+    "telephone booth",
+    "phone booth",
+    "double-decker bus",
+}
+
+
+async def _process_media_analyzer(
+    session: SessionState, post: dict, image_bytes: bytes
+) -> list[dict]:
+    """Run media-analyzer (OCR + DETR object detection) on the image. For
+    every OCR line and recognized object that resolves to a known
+    place/landmark via the geocoder, emit a finding and contribute a
+    signal so the aggregator can corroborate."""
+    analysis: MediaAnalysis = await _media_analyzer_analyze(image_bytes)
+    if analysis.is_empty:
+        return []
+
+    shortcode = post.get("shortcode") or "unknown"
+    signals: list[dict] = []
+
+    # ---- OCR-based geocoding -----------------------------------------------
+    seen_geocoded: set[str] = set()
+    for line in analysis.ocr_lines:
+        text = line.text.strip()
+        if len(text) < 3:
+            continue
+        hit = await geocode_text(text)
+        if hit is None:
+            continue
+        key = f"{hit.lat:.4f},{hit.lon:.4f}"
+        if key in seen_geocoded:
+            continue
+        seen_geocoded.add(key)
+
+        finding_metadata: dict[str, Any] = {
+            "shortcode": shortcode,
+            "ocr_text": text,
+            "ocr_confidence": line.confidence,
+            "lat": hit.lat,
+            "lon": hit.lon,
+            "geocoded_via": hit.method,
+            "geocoded_match": hit.name,
+            "geocode_confidence": hit.confidence,
+        }
+        if hit.country:
+            finding_metadata["country"] = hit.country
+        if hit.kind == "city":
+            finding_metadata["city"] = hit.name
+
+        await _emit_finding(
+            session,
+            Finding(
+                source="media_analyzer_ocr",
+                evidence_chain=[
+                    f"Post: {_shortcode_url(shortcode)}",
+                    f"OCR text in image: {text!r} (conf {line.confidence:.2f})",
+                    f"Geocoded to: {hit.name}, {hit.country} "
+                    f"({hit.lat:.4f}, {hit.lon:.4f})",
+                ],
+                confidence=min(0.85, 0.5 * line.confidence + 0.5 * hit.confidence),
+                risk_level="MEDIUM",
+                remediation=(
+                    f"Text visible in {_shortcode_url(shortcode)} "
+                    f"(\"{text}\") reveals {hit.name}. Crop the post or remove "
+                    "frames that show readable signage / text."
+                ),
+                metadata=finding_metadata,
+            ),
+        )
+        signals.append(
+            {
+                "type": "media_analyzer_ocr",
+                "description": f"OCR matched {hit.name}",
+                "location_hint": f"{hit.name}, {hit.country}".strip(", "),
+                "confidence": min(0.85, 0.5 * line.confidence + 0.5 * hit.confidence),
+                "shortcode": shortcode,
+                "lat": hit.lat,
+                "lon": hit.lon,
+            }
+        )
+
+    # ---- Object-detection signals -----------------------------------------
+    # Object labels alone don't give coordinates, but they corroborate the
+    # aggregator's region call (e.g. "double-decker bus" + UK signals).
+    for obj in analysis.objects:
+        if obj.label not in _LOCATION_HINT_OBJECTS:
+            continue
+        signals.append(
+            {
+                "type": "media_analyzer_object",
+                "description": f"Detected {obj.label} in image",
+                "location_hint": obj.label,
+                "confidence": min(0.6, obj.confidence),
+                "shortcode": shortcode,
+            }
+        )
+
+    # Surface OCR text that didn't geocode but might still be useful evidence,
+    # so the aggregator's Sonnet pass can reason over it.
+    for line in analysis.ocr_lines:
+        text = line.text.strip()
+        if not text or any(
+            text.lower() in s.get("location_hint", "").lower() for s in signals
+        ):
+            continue
+        signals.append(
+            {
+                "type": "media_analyzer_ocr_raw",
+                "description": text[:120],
+                "location_hint": text[:120],
+                "confidence": min(0.5, line.confidence),
+                "shortcode": shortcode,
+            }
+        )
+
+    return signals
+
+
 async def _process_post(
     session: SessionState, post: dict
 ) -> list[dict]:
@@ -660,9 +809,18 @@ async def _process_post(
     vlm_signals = await _process_vlm(session, post, image_bytes, media_type)
     signals.extend(vlm_signals)
 
-    # Channel 4 — GeoCLIP.
+    # Channel 4 — GeoCLIP (image → coordinate prediction).
     geoclip_signals = await _process_geoclip(session, post, image_bytes)
     signals.extend(geoclip_signals)
+
+    # Channel 5 — media-analyzer (OCR + object detection from systems/).
+    try:
+        media_signals = await _process_media_analyzer(session, post, image_bytes)
+    except Exception as exc:  # noqa: BLE001 — never let one bad image stop the pipeline
+        logger = __import__("logging").getLogger(__name__)
+        logger.debug("media_analyzer channel failed for post: %s", exc)
+        media_signals = []
+    signals.extend(media_signals)
 
     return signals
 
@@ -678,7 +836,7 @@ async def _run_aggregation(
     settings = get_settings()
     cost_tracker = session.data.get("cost_tracker")
     anthropic = session.data.get("anthropic")
-    if anthropic is None or not settings.anthropic_api_key:
+    if anthropic is None or not settings.gemini_api_key:
         return
     if cost_tracker is not None and not cost_tracker.can_spend(
         _SONNET_AGGREGATION_COST_GUESS
@@ -694,7 +852,7 @@ async def _run_aggregation(
 
     try:
         text, usage = await anthropic.call_text(
-            model=settings.anthropic_sonnet_model,
+            model=settings.gemini_pro_model,
             system=_AGGREGATOR_SYSTEM_PROMPT,
             user_content=user_prompt,
             max_tokens=1500,

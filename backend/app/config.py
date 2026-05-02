@@ -54,12 +54,15 @@ def _env_bool(key: str, default: bool) -> bool:
 
 @dataclass(frozen=True)
 class Settings:
-    # Anthropic
-    anthropic_api_key: str
-    anthropic_api_url: str
-    anthropic_version: str
-    anthropic_sonnet_model: str
-    anthropic_haiku_model: str
+    # Gemini (Google AI Studio) — replaced Anthropic after we ran out of
+    # Anthropic credits during the hackathon. ``pro_model`` is the
+    # reasoning-heavy model used by aggregator + query gen + geolocation
+    # cluster pass; ``fast_model`` is the cheap model used for vision +
+    # web triage + PII extraction.
+    gemini_api_key: str
+    gemini_api_url: str
+    gemini_pro_model: str
+    gemini_fast_model: str
 
     # Serper.dev (web_footprint search backend; replaced Google CSE
     # after Google closed Custom Search JSON API to new accounts in 2026)
@@ -71,11 +74,11 @@ class Settings:
     web_footprint_max_queries: int
     web_footprint_max_full_fetches: int
 
-    # Anthropic pricing
-    claude_sonnet_input_cost_per_million: float
-    claude_sonnet_output_cost_per_million: float
-    claude_haiku_input_cost_per_million: float
-    claude_haiku_output_cost_per_million: float
+    # Gemini pricing ($ / million tokens)
+    gemini_pro_input_cost_per_million: float
+    gemini_pro_output_cost_per_million: float
+    gemini_fast_input_cost_per_million: float
+    gemini_fast_output_cost_per_million: float
 
     # App / session
     frontend_url: str
@@ -92,15 +95,12 @@ class Settings:
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     return Settings(
-        anthropic_api_key=_env_str("ANTHROPIC_API_KEY"),
-        anthropic_api_url=_env_str(
-            "ANTHROPIC_API_URL", "https://api.anthropic.com/v1/messages"
+        gemini_api_key=_env_str("GEMINI_API_KEY"),
+        gemini_api_url=_env_str(
+            "GEMINI_API_URL", "https://generativelanguage.googleapis.com/v1beta"
         ),
-        anthropic_version=_env_str("ANTHROPIC_VERSION", "2023-06-01"),
-        anthropic_sonnet_model=_env_str("ANTHROPIC_SONNET_MODEL", "claude-sonnet-4-6"),
-        anthropic_haiku_model=_env_str(
-            "ANTHROPIC_HAIKU_MODEL", "claude-haiku-4-5-20251001"
-        ),
+        gemini_pro_model=_env_str("GEMINI_PRO_MODEL", "gemini-2.5-pro"),
+        gemini_fast_model=_env_str("GEMINI_FAST_MODEL", "gemini-2.5-flash"),
         serper_api_key=_env_str("SERPER_API_KEY"),
         audit_cost_ceiling_usd=_env_float("AUDIT_COST_CEILING_USD", 1.0),
         web_footprint_budget_share_usd=_env_float(
@@ -108,17 +108,17 @@ def get_settings() -> Settings:
         ),
         web_footprint_max_queries=_env_int("WEB_FOOTPRINT_MAX_QUERIES", 15),
         web_footprint_max_full_fetches=_env_int("WEB_FOOTPRINT_MAX_FULL_FETCHES", 20),
-        claude_sonnet_input_cost_per_million=_env_float(
-            "CLAUDE_SONNET_INPUT_COST_PER_MILLION", 3.0
+        gemini_pro_input_cost_per_million=_env_float(
+            "GEMINI_PRO_INPUT_COST_PER_MILLION", 1.25
         ),
-        claude_sonnet_output_cost_per_million=_env_float(
-            "CLAUDE_SONNET_OUTPUT_COST_PER_MILLION", 15.0
+        gemini_pro_output_cost_per_million=_env_float(
+            "GEMINI_PRO_OUTPUT_COST_PER_MILLION", 10.0
         ),
-        claude_haiku_input_cost_per_million=_env_float(
-            "CLAUDE_HAIKU_INPUT_COST_PER_MILLION", 1.0
+        gemini_fast_input_cost_per_million=_env_float(
+            "GEMINI_FAST_INPUT_COST_PER_MILLION", 0.30
         ),
-        claude_haiku_output_cost_per_million=_env_float(
-            "CLAUDE_HAIKU_OUTPUT_COST_PER_MILLION", 5.0
+        gemini_fast_output_cost_per_million=_env_float(
+            "GEMINI_FAST_OUTPUT_COST_PER_MILLION", 2.50
         ),
         frontend_url=_env_str("FRONTEND_URL", "http://localhost:5173"),
         session_cookie_name=_env_str("SESSION_COOKIE_NAME", "shieldclaw_session"),

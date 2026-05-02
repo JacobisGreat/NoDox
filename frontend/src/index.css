@@ -37,3 +37,47 @@ body {
 *::-webkit-scrollbar-thumb:hover {
   background: rgba(31, 63, 99, 0.85);
 }
+
+/* Leaflet dark-theme overrides for GeoMap. The CartoDB Dark Matter tiles
+   are dark, so the default white attribution box looks broken. */
+.leaflet-container {
+  background: #0a0f1e !important;
+  font-family: inherit;
+}
+.leaflet-tile {
+  filter: contrast(1.05) saturate(0.85);
+}
+.leaflet-control-attribution {
+  background: rgba(10, 15, 30, 0.7) !important;
+  color: #94a3b8 !important;
+  border: 1px solid rgba(31, 63, 99, 0.4);
+  border-radius: 4px;
+  font-size: 10px;
+}
+.leaflet-control-attribution a {
+  color: #00d4ff !important;
+}
+
+/* Centroid pulse — fires after the hyperzoom lands. */
+@keyframes nodoxx-geo-pulse {
+  0% {
+    stroke-opacity: 0.95;
+    stroke-width: 2;
+    transform: scale(1);
+  }
+  50% {
+    stroke-opacity: 0.4;
+    stroke-width: 4;
+    transform: scale(1.6);
+  }
+  100% {
+    stroke-opacity: 0.95;
+    stroke-width: 2;
+    transform: scale(1);
+  }
+}
+.nodoxx-geo-pulse {
+  transform-origin: center;
+  transform-box: fill-box;
+  animation: nodoxx-geo-pulse 2.4s ease-in-out infinite;
+}

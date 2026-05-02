@@ -403,10 +403,18 @@ def _is_claimed(
         m_match = (status_code == m_code) and (m_string in body_for_match)
         return bool(e_match and not m_match)
 
-    # ---- Sherlock 3-mode fallback ----
+    # ---- Sherlock 3-mode fallback (used only when WMN markers absent) ----
     error_types: list[str] = list(platform.get("error_types") or [])
     if not error_types:
         error_types = ["status_code"]
+
+    # Defensive 2xx gate for message-only sites: a 30x/4xx/5xx response
+    # never has a valid profile body regardless of which negative
+    # patterns aren't in it. Without this, redirects-to-error masquerade
+    # as hits (AniWorld 302, etc.).
+    if "message" in error_types and "status_code" not in error_types:
+        if not (200 <= status_code < 300):
+            return False
 
     for et in error_types:
         if et == "message":
@@ -419,6 +427,9 @@ def _is_claimed(
                 if status_code in error_codes:
                     return False
             elif not (200 <= status_code < 300):
+                # Bare status-code-only sites: only 2xx counts as found.
+                # follow_redirects=False at the call site means a 30x to
+                # a login wall no longer masks "not found".
                 return False
         elif et == "response_url":
             if not (200 <= status_code < 300):

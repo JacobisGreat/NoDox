@@ -26,7 +26,10 @@ from app.schemas.findings import Finding
 from app.services import account_probe as _account_probe
 from app.services import breach_check as _breach_check
 from app.services import dork_catalog as _dork_catalog
+from app.services import gravatar as _gravatar
 from app.services import intelbase as _intelbase
+from app.services import searchcode as _searchcode
+from app.services import spiderfoot_catalog as _sf_catalog
 from app.services.serper import SerperClient, SerperError
 from app.services.trafilatura_fetch import TrafilaturaFetcher
 from app.session_store import SessionState
@@ -94,6 +97,9 @@ def _base_queries(username: str, full_name: str) -> list[str]:
     # DorkER-derived patterns. De-duplicated via the set in run().
     queries.extend(_dork_catalog.dorks_for_username(username))
     queries.extend(_dork_catalog.dorks_for_full_name(full_name))
+    # SpiderFoot-derived patterns: paste sites, code hosts, leak archives.
+    queries.extend(_sf_catalog.dorks_for_username(username))
+    queries.extend(_sf_catalog.dorks_for_full_name(full_name))
     return queries
 
 
@@ -109,7 +115,7 @@ async def _generate_custom_queries(
     settings = get_settings()
     cost_tracker = session.data.get("cost_tracker")
     anthropic = session.data.get("anthropic")
-    if anthropic is None or not settings.anthropic_api_key:
+    if anthropic is None or not settings.gemini_api_key:
         return []
     if cost_tracker is not None and not cost_tracker.can_spend(
         _SONNET_QUERY_GEN_COST_GUESS, scope=_SCOPE
@@ -129,7 +135,7 @@ async def _generate_custom_queries(
 
     try:
         text, usage = await anthropic.call_text(
-            model=settings.anthropic_sonnet_model,
+            model=settings.gemini_pro_model,
             system=_QUERY_GEN_SYSTEM_PROMPT,
             user_content=user_prompt,
             max_tokens=1200,
@@ -169,7 +175,7 @@ async def _triage_result(
     settings = get_settings()
     cost_tracker = session.data.get("cost_tracker")
     anthropic = session.data.get("anthropic")
-    if anthropic is None or not settings.anthropic_api_key:
+    if anthropic is None or not settings.gemini_api_key:
         return None
     if cost_tracker is not None and not cost_tracker.can_spend(
         _HAIKU_TRIAGE_COST_GUESS, scope=_SCOPE
@@ -184,7 +190,7 @@ async def _triage_result(
     }
     try:
         text, usage = await anthropic.call_text(
-            model=settings.anthropic_haiku_model,
+            model=settings.gemini_fast_model,
             system=_TRIAGE_SYSTEM_PROMPT,
             user_content=json.dumps(payload, ensure_ascii=False),
             max_tokens=400,
@@ -211,7 +217,7 @@ async def _extract_pii(
     settings = get_settings()
     cost_tracker = session.data.get("cost_tracker")
     anthropic = session.data.get("anthropic")
-    if anthropic is None or not settings.anthropic_api_key:
+    if anthropic is None or not settings.gemini_api_key:
         return []
     if cost_tracker is not None and not cost_tracker.can_spend(
         _HAIKU_EXTRACT_COST_GUESS, scope=_SCOPE
@@ -223,7 +229,7 @@ async def _extract_pii(
 
     try:
         text, usage = await anthropic.call_text(
-            model=settings.anthropic_haiku_model,
+            model=settings.gemini_fast_model,
             system=_extract_system_prompt(username, full_name),
             user_content=f"Page content:\n\n{page_text}",
             max_tokens=1500,
@@ -622,6 +628,153 @@ async def _run_intelbase_lookup(
             )
 
 
+async def _run_searchcode_pivot(
+    session: SessionState,
+    http,
+    username: str,
+    seen_emails: set[str],
+) -> None:
+    """SpiderFoot sfp_searchcode-style pivot: probe searchcode.com for
+    username + email mentions in public source repositories."""
+    queries: list[str] = []
+    if username:
+        queries.append(username)
+    queries.extend(sorted(seen_emails))
+    if not queries:
+        return
+
+    findings_log: list[dict] = session.data.setdefault("findings", [])
+    seen_repos: set[str] = set()
+
+    for query in queries:
+        try:
+            hits = await _searchcode.search(query, http, max_results=12)
+        except Exception:
+            continue
+        for hit in hits:
+            repo_key = hit.repo or hit.file_url
+            if not repo_key or repo_key in seen_repos:
+                continue
+            seen_repos.add(repo_key)
+
+            evidence_chain = [
+                f"searchcode query: {query!r}",
+                f"Repo: {hit.repo or 'unknown'}",
+            ]
+            if hit.file_url:
+                evidence_chain.append(f"File: {hit.file_url}")
+            if hit.language:
+                evidence_chain.append(f"Language: {hit.language}")
+            if hit.snippet:
+                evidence_chain.append(f"Snippet: {hit.snippet[:200]}")
+
+            finding = Finding(
+                source="searchcode",
+                evidence_chain=evidence_chain,
+                confidence=0.6,
+                risk_level="MEDIUM",
+                remediation=(
+                    f"A reference to {query!r} appears in public source code "
+                    f"at {hit.file_url or hit.repo}. If the repository is yours, "
+                    "scrub commit history and rotate any exposed credentials. "
+                    "If it isn't yours, request takedown or report under the "
+                    "host's DMCA process."
+                ),
+                metadata={
+                    "query": query,
+                    "repo": hit.repo,
+                    "file_url": hit.file_url,
+                    "language": hit.language,
+                },
+            )
+            payload = finding.to_dict()
+            tagged = dict(payload)
+            tagged["_pipeline"] = _PIPELINE
+            findings_log.append(tagged)
+            await session.publish_event(_finding_event(_PIPELINE, payload))
+
+
+async def _run_gravatar_pivot(
+    session: SessionState,
+    http,
+    seen_emails: set[str],
+) -> None:
+    """SpiderFoot sfp_gravatar-style pivot: for each surfaced email,
+    fetch the Gravatar profile (free, no auth) and emit findings for any
+    linked accounts, alternate emails, phone numbers, or real names."""
+    if not seen_emails:
+        return
+
+    findings_log: list[dict] = session.data.setdefault("findings", [])
+
+    for email in sorted(seen_emails):
+        try:
+            profile = await _gravatar.lookup_email(email, http)
+        except Exception:
+            continue
+        if profile is None or profile.is_empty:
+            continue
+
+        evidence_chain = [
+            f"Email: {email}",
+            f"Gravatar profile: {profile.raw_url}",
+        ]
+        if profile.full_name:
+            evidence_chain.append(f"Real name: {profile.full_name}")
+        if profile.preferred_username:
+            evidence_chain.append(
+                f"Preferred username: {profile.preferred_username}"
+            )
+        if profile.extra_emails:
+            evidence_chain.append(
+                f"Other emails: {', '.join(profile.extra_emails[:5])}"
+            )
+        if profile.phone_numbers:
+            evidence_chain.append(
+                f"Phone numbers: {', '.join(profile.phone_numbers[:5])}"
+            )
+        if profile.accounts:
+            sites = sorted(
+                {a.site or _domain_of(a.url) for a in profile.accounts if a.site or a.url}
+            )
+            evidence_chain.append(
+                f"Linked accounts ({len(sites)}): {', '.join(sites[:8])}"
+            )
+
+        risk = "HIGH" if (profile.phone_numbers or profile.full_name) else "MEDIUM"
+
+        finding = Finding(
+            source="gravatar",
+            evidence_chain=evidence_chain,
+            confidence=0.85,
+            risk_level=risk,  # type: ignore[arg-type]
+            remediation=(
+                f"Gravatar exposes the profile linked to {email} (real name, "
+                "linked socials, possible phone numbers) on every site that "
+                "uses Gravatar avatars. Sign in at gravatar.com, scrub the "
+                "profile fields you don't want public, or delete the account "
+                "entirely if you don't recognise it."
+            ),
+            metadata={
+                "email": email,
+                "gravatar_url": profile.raw_url,
+                "full_name": profile.full_name,
+                "preferred_username": profile.preferred_username,
+                "extra_emails": list(profile.extra_emails),
+                "phone_numbers": list(profile.phone_numbers),
+                "accounts": [
+                    {"site": a.site, "url": a.url, "username": a.username}
+                    for a in profile.accounts
+                ],
+            },
+        )
+        payload = finding.to_dict()
+        tagged = dict(payload)
+        tagged["_pipeline"] = _PIPELINE
+        findings_log.append(tagged)
+        await session.publish_event(_finding_event(_PIPELINE, payload))
+
+
 def _domain_of(url: str) -> str:
     if not url:
         return ""
@@ -836,6 +989,9 @@ async def run(session: SessionState) -> None:
         await _run_account_probe(session, username, http)
         await _run_breach_check(session, http, seen_emails)
         await _run_intelbase_lookup(session, http, seen_emails)
+        # SpiderFoot-derived pivots (free, no auth).
+        await _run_searchcode_pivot(session, http, username, seen_emails)
+        await _run_gravatar_pivot(session, http, seen_emails)
 
         await session.publish_event(_pipeline_status_event(_PIPELINE, "complete"))
     except Exception as exc:  # noqa: BLE001 — defensive top-level guard

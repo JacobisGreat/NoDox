@@ -41,6 +41,12 @@ async def lifespan(app: FastAPI):
             await warm_geocoder()
         except Exception as exc:
             logger.info("geocode_text warm-up skipped: %s", exc)
+        try:
+            from app.services.media_analyzer_bridge import warmup as warm_media
+
+            await warm_media()
+        except Exception as exc:
+            logger.info("media_analyzer warm-up skipped: %s", exc)
 
     warm_task = asyncio.create_task(_warm(), name="geoclip-warm")
 

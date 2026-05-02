@@ -11,3 +11,23 @@ NoDox's pipelines consume — no offline merge step is needed.
 
 If WhatsMyName data (CC-BY-SA 4.0, used by `systems/blackbird/`) is added
 later, list it here with attribution to https://github.com/WebBreacher/WhatsMyName.
+
+## Code attribution
+
+`backend/app/services/spiderfoot_catalog.py`,
+`backend/app/services/searchcode.py`, and
+`backend/app/services/gravatar.py` are derivative async ports / pattern
+extractions of these SpiderFoot modules (all MIT-licensed):
+
+- `systems/spiderfoot/modules/sfp_pastebin.py`
+- `systems/spiderfoot/modules/sfp_grep_app.py`
+- `systems/spiderfoot/modules/sfp_searchcode.py`
+- `systems/spiderfoot/modules/sfp_gravatar.py`
+- `systems/spiderfoot/modules/sfp_filemeta.py`
+
+Upstream project: https://github.com/smicallef/spiderfoot
+See `systems/spiderfoot/LICENSE`.
+
+`backend/app/services/dork_catalog.py` is translated from the MIT-
+licensed DorkER project (`systems/DorkER/dorker.py`).
+Upstream: https://github.com/JustDanio/DorkER (see `systems/DorkER/LICENSE`).

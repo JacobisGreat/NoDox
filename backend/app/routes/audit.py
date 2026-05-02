@@ -20,8 +20,8 @@ from app.schemas.events import (
     stream_done as _stream_done_event,
 )
 from app.services.aggregator import run as run_aggregator
-from app.services.anthropic_client import AnthropicClient
 from app.services.cost_tracker import CostTracker
+from app.services.gemini_client import GeminiClient
 from app.services.image_downloader import ImageDownloader
 from app.session_store import get_session
 
@@ -59,11 +59,14 @@ def _build_session_services(session) -> None:
         )
     http: httpx.AsyncClient = session.data["http"]
 
+    # The dict key stays "anthropic" for back-compat across the pipelines —
+    # nothing inside cares about the underlying provider, they just call
+    # ``client.call_text`` / ``client.call_vision``. The actual instance is
+    # now Gemini.
     if "anthropic" not in session.data:
-        session.data["anthropic"] = AnthropicClient(
-            api_key=settings.anthropic_api_key,
-            api_url=settings.anthropic_api_url,
-            version=settings.anthropic_version,
+        session.data["anthropic"] = GeminiClient(
+            api_key=settings.gemini_api_key,
+            api_url=settings.gemini_api_url,
             http=http,
         )
 
@@ -76,17 +79,17 @@ def _build_session_services(session) -> None:
             scope_budgets={
                 "web_footprint": settings.web_footprint_budget_share_usd,
             },
-            sonnet_in=settings.claude_sonnet_input_cost_per_million,
-            sonnet_out=settings.claude_sonnet_output_cost_per_million,
-            haiku_in=settings.claude_haiku_input_cost_per_million,
-            haiku_out=settings.claude_haiku_output_cost_per_million,
-            sonnet_model_id=settings.anthropic_sonnet_model,
-            haiku_model_id=settings.anthropic_haiku_model,
+            pro_in=settings.gemini_pro_input_cost_per_million,
+            pro_out=settings.gemini_pro_output_cost_per_million,
+            fast_in=settings.gemini_fast_input_cost_per_million,
+            fast_out=settings.gemini_fast_output_cost_per_million,
+            pro_model_id=settings.gemini_pro_model,
+            fast_model_id=settings.gemini_fast_model,
         )
 
     if "anthropic_semaphore" not in session.data:
-        # Shared across all pipelines, capped at 5 concurrent vision/text
-        # calls so we don't hammer the Anthropic API in any one audit.
+        # Shared across all LLM calls, capped at 5 concurrent vision/text
+        # requests so we don't blow through Gemini's free-tier RPM.
         session.data["anthropic_semaphore"] = asyncio.Semaphore(5)
         session.data["vision_semaphore"] = session.data["anthropic_semaphore"]
 

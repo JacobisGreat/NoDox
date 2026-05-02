@@ -1,4 +1,13 @@
-import { useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
+import {
+  MapContainer,
+  TileLayer,
+  CircleMarker,
+  Circle,
+  useMap,
+} from "react-leaflet";
+import L from "leaflet";
+import "leaflet/dist/leaflet.css";
 import { Finding } from "../types";
 
 interface Props {
@@ -13,6 +22,79 @@ interface GeoPoint {
   label: string | null;
 }
 
+// --------------------------------------------------------------------- //
+// Lazy Nominatim geocoder for findings that arrive with a location name //
+// but no coordinates (Instagram location tags, Sonnet region clusters). //
+// One request per second per process is the OSM use policy; a small     //
+// in-memory cache plus a single-flight queue keeps us well under that.  //
+// --------------------------------------------------------------------- //
+
+interface GeocodeCache {
+  [label: string]: { lat: number; lon: number } | null;
+}
+
+const _geocodeCache: GeocodeCache = {};
+const _geocodeInflight = new Map<string, Promise<{ lat: number; lon: number } | null>>();
+let _geocodeQueueTail: Promise<unknown> = Promise.resolve();
+
+function geocodeLabel(
+  label: string,
+): Promise<{ lat: number; lon: number } | null> {
+  const key = label.trim().toLowerCase();
+  if (!key) return Promise.resolve(null);
+  if (key in _geocodeCache) return Promise.resolve(_geocodeCache[key]);
+  const inflight = _geocodeInflight.get(key);
+  if (inflight) return inflight;
+
+  // Chain onto a serial queue with ~1.1s spacing so we never burst Nominatim.
+  const job = (async () => {
+    await _geocodeQueueTail.catch(() => undefined);
+    try {
+      const url = new URL("https://nominatim.openstreetmap.org/search");
+      url.searchParams.set("q", label);
+      url.searchParams.set("format", "json");
+      url.searchParams.set("limit", "1");
+      const resp = await fetch(url.toString(), {
+        headers: { Accept: "application/json" },
+      });
+      if (!resp.ok) {
+        _geocodeCache[key] = null;
+        return null;
+      }
+      const data = (await resp.json()) as Array<{
+        lat?: string;
+        lon?: string;
+      }>;
+      if (!Array.isArray(data) || data.length === 0) {
+        _geocodeCache[key] = null;
+        return null;
+      }
+      const lat = Number(data[0]?.lat);
+      const lon = Number(data[0]?.lon);
+      if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+        _geocodeCache[key] = null;
+        return null;
+      }
+      const result = { lat, lon };
+      _geocodeCache[key] = result;
+      return result;
+    } catch {
+      _geocodeCache[key] = null;
+      return null;
+    }
+  })();
+
+  _geocodeInflight.set(key, job);
+  // Brief spacing so we stay polite to Nominatim but the first centroid
+  // lands fast — the user wants to SEE the zoom, not wait on geocoding.
+  _geocodeQueueTail = job.then(
+    () => new Promise((r) => window.setTimeout(r, 350)),
+    () => new Promise((r) => window.setTimeout(r, 350)),
+  );
+  job.finally(() => _geocodeInflight.delete(key));
+  return job;
+}
+
 interface Centroid {
   lat: number;
   lon: number;
@@ -21,43 +103,29 @@ interface Centroid {
   bestLabel: string | null;
 }
 
-const MAP_WIDTH = 720;
-const MAP_HEIGHT = 360;
-const MIN_RADIUS_KM = 25;
 const EARTH_RADIUS_KM = 6371;
+const MIN_RADIUS_KM = 25;
 
-// Simplified continent silhouettes in an equirectangular projection, each path
-// drawn as a polygon in a 720x360 canvas (lon -180..180 → x 0..720, lat
-// 90..-90 → y 0..360). Hand-traced from a low-res CC0 outline; precision is
-// only as good as a "this is roughly Earth" reference needs to be.
-const CONTINENT_PATHS: string[] = [
-  // North America
-  "M 100 80 L 175 70 L 215 95 L 250 110 L 245 135 L 270 155 L 250 180 L 215 195 L 180 200 L 165 215 L 140 220 L 130 200 L 115 175 L 90 145 L 80 110 Z",
-  // Greenland
-  "M 270 55 L 305 50 L 320 80 L 305 105 L 280 100 L 270 80 Z",
-  // South America
-  "M 220 215 L 255 210 L 280 235 L 295 270 L 285 305 L 265 330 L 245 345 L 235 320 L 225 285 L 215 245 Z",
-  // Europe
-  "M 360 90 L 405 85 L 430 100 L 425 125 L 395 130 L 365 120 Z",
-  // Africa
-  "M 370 145 L 425 140 L 455 170 L 470 215 L 450 270 L 415 295 L 390 285 L 380 245 L 370 200 Z",
-  // Middle East / West Asia
-  "M 435 130 L 475 130 L 490 155 L 470 170 L 440 165 Z",
-  // Asia
-  "M 440 75 L 540 65 L 605 80 L 645 105 L 660 135 L 615 155 L 580 165 L 540 155 L 500 145 L 470 125 L 445 105 Z",
-  // SE Asia / India
-  "M 510 160 L 555 165 L 580 185 L 595 215 L 575 230 L 545 215 L 525 195 Z",
-  // Australia
-  "M 580 250 L 635 245 L 665 265 L 660 290 L 625 295 L 590 280 Z",
-];
+// CartoDB Dark Matter — free, no API key, dark palette matches the theme.
+const TILE_URL =
+  "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png";
+const TILE_ATTR =
+  '&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a> &copy; <a href="https://carto.com/attributions">CARTO</a>';
 
-function projectLonLat(lon: number, lat: number): { x: number; y: number } {
-  const x = ((lon + 180) / 360) * MAP_WIDTH;
-  const y = ((90 - lat) / 180) * MAP_HEIGHT;
-  return { x, y };
-}
+// Fast cinematic zoom: a single Leaflet flyTo from world view to city.
+// flyTo natively interpolates pan + zoom along a smooth zoom-out-arc-
+// zoom-in curve; chaining multiple flyTos breaks that arc into disjoint
+// segments and feels janky.
+const ZOOM_TARGET = 13; // city
+const ZOOM_DURATION_S = 1.2;
+// Lower easeLinearity = more aggressive bezier; 1.0 = linear. 0.1 punches in.
+const ZOOM_EASE = 0.1;
+const ZOOM_TOTAL_MS = ZOOM_DURATION_S * 1000;
 
-function haversineKm(a: GeoPoint, b: { lat: number; lon: number }): number {
+function haversineKm(
+  a: { lat: number; lon: number },
+  b: { lat: number; lon: number },
+): number {
   const toRad = (d: number) => (d * Math.PI) / 180;
   const dLat = toRad(b.lat - a.lat);
   const dLon = toRad(b.lon - a.lon);
@@ -69,32 +137,64 @@ function haversineKm(a: GeoPoint, b: { lat: number; lon: number }): number {
   return 2 * EARTH_RADIUS_KM * Math.asin(Math.min(1, Math.sqrt(h)));
 }
 
-function extractPoints(findings: Finding[]): GeoPoint[] {
-  const out: GeoPoint[] = [];
+interface RawSignal {
+  coords: { lat: number; lon: number } | null;
+  label: string | null;
+  confidence: number;
+  source: string;
+}
+
+/**
+ * Collect candidate signals from findings. Returns coords-direct entries
+ * (EXIF GPS, GeoCLIP) AS-IS, and label-only entries (Instagram location
+ * tag, Sonnet region cluster) with coords=null so the caller can geocode
+ * them asynchronously.
+ */
+function collectSignals(findings: Finding[]): RawSignal[] {
+  const out: RawSignal[] = [];
   for (const f of findings) {
     const md = f.metadata as Record<string, unknown> | undefined;
     if (!md) continue;
+
     const lat = typeof md.lat === "number" ? md.lat : null;
     const lon = typeof md.lon === "number" ? md.lon : null;
-    if (lat === null || lon === null) continue;
-    if (lat < -90 || lat > 90 || lon < -180 || lon > 180) continue;
     const city = typeof md.city === "string" ? md.city : "";
     const country = typeof md.country === "string" ? md.country : "";
-    const label = [city, country].filter(Boolean).join(", ") || null;
-    out.push({
-      lat,
-      lon,
-      confidence: Math.max(0, Math.min(1, f.confidence)),
-      source: f.source,
-      label,
-    });
+    const locName =
+      typeof md.location_name === "string" ? md.location_name : "";
+    const region = typeof md.region === "string" ? md.region : "";
+
+    const label =
+      [city, country].filter(Boolean).join(", ") ||
+      locName ||
+      region ||
+      null;
+
+    const conf = Math.max(0, Math.min(1, f.confidence));
+
+    if (
+      lat !== null &&
+      lon !== null &&
+      lat >= -90 &&
+      lat <= 90 &&
+      lon >= -180 &&
+      lon <= 180
+    ) {
+      out.push({
+        coords: { lat, lon },
+        label,
+        confidence: conf,
+        source: f.source,
+      });
+    } else if (label) {
+      out.push({ coords: null, label, confidence: conf, source: f.source });
+    }
   }
   return out;
 }
 
 function computeCentroid(points: GeoPoint[]): Centroid | null {
   if (points.length === 0) return null;
-  // Weighted by confidence (with a small floor so zero-conf points still count).
   let totalW = 0;
   let lat = 0;
   let lon = 0;
@@ -116,16 +216,11 @@ function computeCentroid(points: GeoPoint[]): Centroid | null {
   }
   weightedConf /= totalW;
 
-  // Radius reflects the spread of evidence. With a single point, fall back to
-  // a confidence-derived ring so the map still communicates uncertainty.
-  let radiusKm: number;
-  if (points.length === 1) {
-    radiusKm = Math.max(MIN_RADIUS_KM, (1 - weightedConf) * 1500);
-  } else {
-    radiusKm = Math.max(MIN_RADIUS_KM, maxDist);
-  }
+  const radiusKm =
+    points.length === 1
+      ? Math.max(MIN_RADIUS_KM, (1 - weightedConf) * 1500)
+      : Math.max(MIN_RADIUS_KM, maxDist);
 
-  // Pick the most informative city label among the contributing points.
   const labelCounts = new Map<string, number>();
   for (const p of points) {
     if (p.label) labelCounts.set(p.label, (labelCounts.get(p.label) ?? 0) + 1);
@@ -142,15 +237,121 @@ function computeCentroid(points: GeoPoint[]): Centroid | null {
   return { lat, lon, meanConfidence: weightedConf, radiusKm, bestLabel };
 }
 
-function radiusKmToSvgPixels(radiusKm: number): number {
-  const degrees = radiusKm / 111;
-  const px = (degrees / 180) * MAP_HEIGHT;
-  return Math.max(6, Math.min(MAP_WIDTH * 0.6, px));
+/**
+ * One smooth flyTo from world view to city level. Leaflet's flyTo
+ * natively interpolates pan + zoom along a parabolic arc — splitting
+ * it into multiple hops breaks that arc into disjoint segments and
+ * feels janky. We snap to a global vantage first (no animation) so
+ * every fly looks the same regardless of starting state, then run
+ * exactly one cinematic flight to the centroid.
+ *
+ * Re-runs only when the target moves more than ~1km (3-decimal lat/lon).
+ */
+function HyperzoomController({ centroid }: { centroid: Centroid }) {
+  const map = useMap();
+
+  useEffect(() => {
+    const target: L.LatLngExpression = [centroid.lat, centroid.lon];
+
+    // Always snap to a global vantage so the cinematic arc reads from
+    // the start, even on re-mount or when the centroid hasn't moved.
+    map.stop();
+    map.setView([20, 0], 2, { animate: false });
+
+    // Invalidate size in case the panel just appeared, then fly. A
+    // single rAF is enough for layout to settle without the 80ms wait.
+    const raf = window.requestAnimationFrame(() => {
+      map.invalidateSize({ animate: false, pan: false });
+      map.flyTo(target, ZOOM_TARGET, {
+        duration: ZOOM_DURATION_S,
+        easeLinearity: ZOOM_EASE,
+        noMoveStart: true,
+      });
+    });
+
+    return () => {
+      window.cancelAnimationFrame(raf);
+      map.stop();
+    };
+  }, [centroid.lat, centroid.lon, map]);
+
+  return null;
 }
 
 export default function GeoMap({ findings }: Props) {
-  const points = useMemo(() => extractPoints(findings), [findings]);
+  const signals = useMemo(() => collectSignals(findings), [findings]);
+
+  // Pending geocodes — we kick these off in an effect and store the
+  // results in state so the centroid recomputes when each lookup lands.
+  const [resolvedLabels, setResolvedLabels] = useState<GeocodeCache>({});
+
+  useEffect(() => {
+    let cancelled = false;
+    const labels = Array.from(
+      new Set(
+        signals
+          .filter((s) => s.coords === null && s.label)
+          .map((s) => s.label as string),
+      ),
+    );
+    for (const label of labels) {
+      const key = label.trim().toLowerCase();
+      if (key in resolvedLabels) continue;
+      void geocodeLabel(label).then((res) => {
+        if (cancelled) return;
+        setResolvedLabels((prev) =>
+          key in prev ? prev : { ...prev, [key]: res },
+        );
+      });
+    }
+    return () => {
+      cancelled = true;
+    };
+    // resolvedLabels intentionally omitted: we read the latest via the
+    // setter callback so we don't loop on every state update.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [signals]);
+
+  const points = useMemo<GeoPoint[]>(() => {
+    const out: GeoPoint[] = [];
+    for (const s of signals) {
+      let coords = s.coords;
+      if (!coords && s.label) {
+        const cached = resolvedLabels[s.label.trim().toLowerCase()];
+        if (cached) coords = cached;
+      }
+      if (!coords) continue;
+      out.push({
+        lat: coords.lat,
+        lon: coords.lon,
+        confidence: s.confidence,
+        source: s.source,
+        label: s.label,
+      });
+    }
+    return out;
+  }, [signals, resolvedLabels]);
+
   const centroid = useMemo(() => computeCentroid(points), [points]);
+  const [zoomingDone, setZoomingDone] = useState(false);
+
+  // Reset the zoom-done flag when the target moves.
+  useEffect(() => {
+    if (!centroid) {
+      setZoomingDone(false);
+      return;
+    }
+    const totalMs = ZOOM_TOTAL_MS + 120;
+    const t = window.setTimeout(() => setZoomingDone(true), totalMs);
+    return () => window.clearTimeout(t);
+  }, [centroid?.lat, centroid?.lon]);
+
+  const pendingGeocodes = signals.filter(
+    (s) =>
+      s.coords === null &&
+      s.label &&
+      !(s.label.trim().toLowerCase() in resolvedLabels),
+  ).length;
 
   if (!centroid || points.length === 0) {
     return (
@@ -164,14 +365,15 @@ export default function GeoMap({ findings }: Props) {
           </span>
         </header>
         <div className="flex h-40 items-center justify-center rounded-lg border border-dashed border-nodoxx-border/40 text-xs text-nodoxx-muted">
-          Awaiting geolocation evidence with coordinates...
+          {pendingGeocodes > 0
+            ? `Geocoding ${pendingGeocodes} location ${
+                pendingGeocodes === 1 ? "tag" : "tags"
+              }...`
+            : "Awaiting geolocation evidence with coordinates..."}
         </div>
       </section>
     );
   }
-
-  const center = projectLonLat(centroid.lon, centroid.lat);
-  const radiusPx = radiusKmToSvgPixels(centroid.radiusKm);
 
   return (
     <section className="rounded-xl border border-nodoxx-border/30 bg-nodoxx-panel/50 p-4 sm:p-6">
@@ -202,119 +404,76 @@ export default function GeoMap({ findings }: Props) {
 
       {centroid.bestLabel && (
         <p className="mb-3 font-mono text-xs text-nodoxx-accent/90">
-          Best match: <span className="text-nodoxx-text">{centroid.bestLabel}</span>
+          Best match:{" "}
+          <span className="text-nodoxx-text">{centroid.bestLabel}</span>
         </p>
       )}
 
       <div className="relative overflow-hidden rounded-lg border border-nodoxx-border/30 bg-nodoxx-bg">
-        <svg
-          viewBox={`0 0 ${MAP_WIDTH} ${MAP_HEIGHT}`}
-          className="block h-auto w-full"
-          role="img"
-          aria-label="Estimated location map"
+        <MapContainer
+          center={[20, 0]}
+          zoom={2}
+          minZoom={2}
+          maxZoom={18}
+          worldCopyJump
+          zoomControl={false}
+          attributionControl={false}
+          className="h-[420px] w-full"
+          style={{ background: "#0a0f1e" }}
         >
-          {/* Background graticule */}
-          <g stroke="rgba(31,63,99,0.35)" strokeWidth={0.5} fill="none">
-            {[-60, -30, 0, 30, 60].map((lat) => {
-              const y = ((90 - lat) / 180) * MAP_HEIGHT;
-              return (
-                <line key={`lat-${lat}`} x1={0} x2={MAP_WIDTH} y1={y} y2={y} />
-              );
-            })}
-            {[-150, -120, -90, -60, -30, 0, 30, 60, 90, 120, 150].map((lon) => {
-              const x = ((lon + 180) / 360) * MAP_WIDTH;
-              return (
-                <line key={`lon-${lon}`} x1={x} x2={x} y1={0} y2={MAP_HEIGHT} />
-              );
-            })}
-          </g>
+          <TileLayer url={TILE_URL} attribution={TILE_ATTR} />
 
-          {/* Continent silhouettes */}
-          <g
-            fill="rgba(31,63,99,0.45)"
-            stroke="rgba(0,212,255,0.18)"
-            strokeWidth={0.6}
-          >
-            {CONTINENT_PATHS.map((d, i) => (
-              <path key={`c-${i}`} d={d} />
-            ))}
-          </g>
+          <HyperzoomController centroid={centroid} />
 
-          {/* Equator emphasis */}
-          <line
-            x1={0}
-            x2={MAP_WIDTH}
-            y1={MAP_HEIGHT / 2}
-            y2={MAP_HEIGHT / 2}
-            stroke="rgba(148,163,184,0.25)"
-            strokeWidth={0.8}
-            strokeDasharray="3 4"
+          {/* Outer confidence ring (radius reflects evidence spread). */}
+          <Circle
+            center={[centroid.lat, centroid.lon]}
+            radius={centroid.radiusKm * 1000}
+            pathOptions={{
+              color: "#00d4ff",
+              weight: 1.4,
+              opacity: 0.7,
+              dashArray: "5 4",
+              fillColor: "#00d4ff",
+              fillOpacity: 0.08,
+            }}
           />
 
-          {/* Confidence circle */}
-          <circle
-            cx={center.x}
-            cy={center.y}
-            r={radiusPx}
-            fill="rgba(0,212,255,0.12)"
-            stroke="rgba(0,212,255,0.65)"
-            strokeWidth={1.2}
-            strokeDasharray="4 3"
-          />
-
-          {/* Inner ring for emphasis */}
-          <circle
-            cx={center.x}
-            cy={center.y}
-            r={Math.max(4, radiusPx * 0.3)}
-            fill="rgba(0,212,255,0.18)"
-            stroke="rgba(0,212,255,0.85)"
-            strokeWidth={1}
-          />
-
-          {/* Evidence points */}
-          <g>
-            {points.map((p, i) => {
-              const { x, y } = projectLonLat(p.lon, p.lat);
-              const r = 2.5 + p.confidence * 3;
-              return (
-                <circle
-                  key={`p-${i}`}
-                  cx={x}
-                  cy={y}
-                  r={r}
-                  fill="rgba(0,212,255,0.95)"
-                  stroke="#0a0f1e"
-                  strokeWidth={0.8}
-                >
-                  <title>
-                    {p.source} · {p.lat.toFixed(3)}, {p.lon.toFixed(3)} ·{" "}
-                    {(p.confidence * 100).toFixed(0)}%
-                  </title>
-                </circle>
-              );
-            })}
-          </g>
-
-          {/* Centroid crosshair */}
-          <g stroke="#00d4ff" strokeWidth={1.2}>
-            <line
-              x1={center.x - 7}
-              x2={center.x + 7}
-              y1={center.y}
-              y2={center.y}
+          {/* Pulsing inner ring at the centroid — only after the
+              hyperzoom finishes so it doesn't compete during flight. */}
+          {zoomingDone && (
+            <CircleMarker
+              center={[centroid.lat, centroid.lon]}
+              radius={10}
+              pathOptions={{
+                color: "#00d4ff",
+                weight: 2,
+                fillColor: "#00d4ff",
+                fillOpacity: 0.4,
+                className: "nodoxx-geo-pulse",
+              }}
             />
-            <line
-              x1={center.x}
-              x2={center.x}
-              y1={center.y - 7}
-              y2={center.y + 7}
-            />
-          </g>
-        </svg>
+          )}
 
-        <div className="pointer-events-none absolute bottom-2 left-2 rounded bg-nodoxx-bg/80 px-2 py-1 font-mono text-[10px] uppercase tracking-wider text-nodoxx-muted backdrop-blur">
-          equirectangular · weighted by confidence
+          {/* Per-evidence markers. Drawn translucent during flight so
+              the eye stays on the centroid. */}
+          {points.map((p, i) => (
+            <CircleMarker
+              key={`p-${i}`}
+              center={[p.lat, p.lon]}
+              radius={3 + p.confidence * 4}
+              pathOptions={{
+                color: "#0a0f1e",
+                weight: 1,
+                fillColor: "#00d4ff",
+                fillOpacity: zoomingDone ? 0.95 : 0.4,
+              }}
+            />
+          ))}
+        </MapContainer>
+
+        <div className="pointer-events-none absolute bottom-2 left-2 z-[400] rounded bg-nodoxx-bg/80 px-2 py-1 font-mono text-[10px] uppercase tracking-wider text-nodoxx-muted backdrop-blur">
+          leaflet · carto dark · weighted by confidence
         </div>
       </div>
 

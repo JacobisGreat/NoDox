@@ -1,15 +1,24 @@
-"""Loader for the WhatsMyName platform catalog.
+"""Loader for the platform catalog — union of WhatsMyName + Sherlock.
 
-Source of truth: ``wmn-data.json`` — vendored from the WhatsMyName project
-(https://github.com/WebBreacher/WhatsMyName, CC-BY-SA 4.0). The catalog
-ships ~700+ sites with explicit two-sided detection (``e_code`` +
-``e_string`` for "found"; ``m_code`` + ``m_string`` for "missing"). This
-schema is the OSINT community's answer to Sherlock's
-status-code-only false-positive problem — see
-``IDENTITY_FALSE_POSITIVES.md`` for the rationale.
+We read BOTH:
+- ``wmn-data.json`` — WhatsMyName / blackbird's data source. Two-sided
+  detection (``e_code``+``e_string`` AND NOT ``m_string``). ~700 sites,
+  daily-updated, CC-BY-SA 4.0.
+- ``sherlock_data.json`` — Sherlock project catalog. ~478 sites with
+  three-mode detection (status_code / message / response_url). MIT.
 
-The previous Sherlock-derived ``sherlock_data.json`` is kept on disk for
-one release as a roll-back path; the loader reads WMN exclusively.
+When a site appears in BOTH, **WMN wins** (richer signal). When a site is
+only in one, we use that one's rules. The matcher in
+``pipelines/identity.py::_is_claimed`` already handles both schemas, so
+each platform carries the fields appropriate to its source — WMN entries
+have ``e_code``/``e_string``/``m_code``/``m_string``; Sherlock-only
+entries have ``error_types``/``error_messages``/``error_codes``.
+
+This union exists to maximize cross-reference coverage. WMN alone misses
+~296 sites Sherlock catalogs (1337x, Academia.edu, Apple Developer,
+Archive.org, AniWorld, Aparat, …); Sherlock alone misses ~549 WMN sites.
+
+See ``IDENTITY_FALSE_POSITIVES.md`` for the false-positive rationale.
 """
 
 from __future__ import annotations
@@ -25,6 +34,7 @@ logger = logging.getLogger(__name__)
 
 _DATA_DIR = Path(__file__).resolve().parent
 _WMN_FILE = _DATA_DIR / "wmn-data.json"
+_SHERLOCK_FILE = _DATA_DIR / "sherlock_data.json"
 
 # Inferred categories — used by remediation copy and high-risk weighting.
 # WMN exposes a ``cat`` field but its taxonomy doesn't quite match ours.
@@ -261,10 +271,185 @@ def load_platforms() -> list[dict[str, Any]]:
                 "error_messages": error_messages,
                 "error_codes": error_codes,
                 "error_url_template": "",
+                "_source": "wmn",
             }
         )
 
+    # ---- Layer in Sherlock-only sites for coverage ----
+    _merge_sherlock_only(platforms)
     return platforms
+
+
+_SHERLOCK_CATEGORY_KEYWORDS: list[tuple[str, str]] = [
+    ("ebay", "commerce"),
+    ("etsy", "commerce"),
+    ("shop", "commerce"),
+    ("market", "commerce"),
+    ("telegram", "messaging"),
+    ("signal", "messaging"),
+    ("discord", "messaging"),
+    ("linkedin", "professional"),
+    ("xing", "professional"),
+    ("behance", "professional"),
+    ("github", "development"),
+    ("gitlab", "development"),
+    ("stack", "development"),
+    ("hackerrank", "development"),
+    ("leetcode", "development"),
+    ("codepen", "development"),
+    ("codewars", "development"),
+    ("replit", "development"),
+    ("docker", "development"),
+    ("npm", "development"),
+    ("pypi", "development"),
+]
+
+
+def _infer_sherlock_category(name: str) -> str:
+    lname = name.lower()
+    for needle, cat in _SHERLOCK_CATEGORY_KEYWORDS:
+        if needle in lname:
+            return cat
+    return "social_media"
+
+
+def _merge_sherlock_only(platforms: list[dict[str, Any]]) -> None:
+    """Append Sherlock entries whose name isn't already present from WMN.
+
+    WMN's two-sided detection is strictly stronger, so any name overlap
+    keeps the WMN entry. This pass extends coverage to ~300 sites WMN
+    doesn't catalog (1337x, Academia.edu, Archive.org, AniWorld, …).
+    """
+    if not _SHERLOCK_FILE.exists():
+        return
+    try:
+        sherlock = json.loads(_SHERLOCK_FILE.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.warning("sherlock_data.json unreadable: %s", exc)
+        return
+    if not isinstance(sherlock, dict):
+        return
+
+    have = {p["name"].lower() for p in platforms}
+
+    for name, entry in sherlock.items():
+        if name.startswith("$") or not isinstance(entry, dict):
+            continue
+        if name.lower() in have:
+            continue  # WMN wins on overlap
+
+        url_raw = _coerce_str(entry.get("url"))
+        if not url_raw:
+            continue
+        # Sherlock uses ``{}`` placeholder; convert to {username}.
+        url_template = (
+            url_raw if "{username}" in url_raw else url_raw.replace("{}", "{username}")
+        )
+        if "{username}" not in url_template:
+            continue
+
+        url_probe = _coerce_str(entry.get("urlProbe"))
+        probe_template = (
+            (
+                url_probe
+                if "{username}" in url_probe
+                else url_probe.replace("{}", "{username}")
+            )
+            if url_probe
+            else url_template
+        )
+
+        # Normalize errorType to a list.
+        et_raw = entry.get("errorType")
+        if isinstance(et_raw, str):
+            error_types = [et_raw.strip()] if et_raw.strip() else []
+        elif isinstance(et_raw, list):
+            error_types = [str(e).strip() for e in et_raw if str(e).strip()]
+        else:
+            error_types = []
+        if not error_types:
+            error_types = ["status_code"]
+
+        # errorMsg may be string or list.
+        em_raw = entry.get("errorMsg")
+        if isinstance(em_raw, str):
+            error_messages = [em_raw] if em_raw else []
+        elif isinstance(em_raw, list):
+            error_messages = [str(m) for m in em_raw if m]
+        else:
+            error_messages = []
+
+        # errorCode may be int or list.
+        ec_raw = entry.get("errorCode")
+        if isinstance(ec_raw, int):
+            error_codes = [ec_raw]
+        elif isinstance(ec_raw, list):
+            error_codes = []
+            for c in ec_raw:
+                try:
+                    error_codes.append(int(c))
+                except (TypeError, ValueError):
+                    continue
+        else:
+            error_codes = []
+
+        # Skip Sherlock-only entries with no body match AND no explicit
+        # error-code list — those are pure 200-OK guessers and are the
+        # dominant FP class (see IDENTITY_FALSE_POSITIVES.md). When WMN
+        # has the same site we already kept that one.
+        if not error_messages and not error_codes:
+            continue
+
+        regex_check_raw = entry.get("regexCheck")
+        regex_check = (
+            _validate_regex(regex_check_raw)
+            if isinstance(regex_check_raw, str) and regex_check_raw
+            else None
+        )
+
+        method = _coerce_str(entry.get("request_method"), "GET").upper() or "GET"
+        request_payload = entry.get("request_payload")
+        if not isinstance(request_payload, dict):
+            request_payload = None
+
+        headers_raw = entry.get("headers")
+        headers = (
+            {str(k): str(v) for k, v in headers_raw.items()}
+            if isinstance(headers_raw, dict)
+            else {}
+        )
+
+        platforms.append(
+            {
+                "name": str(name),
+                "url_template": url_template,
+                "probe_template": probe_template,
+                "method": method,
+                "headers": headers,
+                "request_payload": request_payload,
+                # No WMN two-sided rules — leave the e_/m_ fields zero so
+                # the matcher falls back to Sherlock 3-mode for these.
+                "e_code": 0,
+                "e_string": "",
+                "m_code": 0,
+                "m_string": "",
+                "protected": False,
+                "regex_check": regex_check,
+                "category": _infer_sherlock_category(str(name)),
+                "nsfw": bool(entry.get("isNSFW", False)),
+                "known": (
+                    [_coerce_str(entry.get("username_claimed"))]
+                    if entry.get("username_claimed")
+                    else []
+                ),
+                "tags": [],
+                "error_types": error_types,
+                "error_messages": error_messages,
+                "error_codes": error_codes,
+                "error_url_template": _coerce_str(entry.get("errorUrl")),
+                "_source": "sherlock",
+            }
+        )
 
 
 def render_url(template: str, username: str) -> str:
