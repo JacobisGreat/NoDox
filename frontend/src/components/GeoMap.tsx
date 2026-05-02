@@ -1,13 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import {
-  MapContainer,
-  TileLayer,
-  CircleMarker,
-  Circle,
-  useMap,
-} from "react-leaflet";
-import L from "leaflet";
-import "leaflet/dist/leaflet.css";
+import Globe, { GlobePoint, GlobeCentroid } from "./Globe";
 import { Finding } from "../types";
 
 interface Props {
@@ -35,13 +27,8 @@ function categoryWeight(c: SignalCategory): number {
   return IMAGE_PRIMARY_WEIGHT;
 }
 
-const TAG_SOURCES = new Set([
-  "instagram_location_tag",
-]);
-const IMAGE_PRIMARY_SOURCES = new Set([
-  "exif_gps",
-  "geoclip_prediction",
-]);
+const TAG_SOURCES = new Set(["instagram_location_tag"]);
+const IMAGE_PRIMARY_SOURCES = new Set(["exif_gps", "geoclip_prediction"]);
 
 function classifySignal(
   source: string,
@@ -60,7 +47,10 @@ interface GeocodeCache {
 }
 
 const _geocodeCache: GeocodeCache = {};
-const _geocodeInflight = new Map<string, Promise<{ lat: number; lon: number } | null>>();
+const _geocodeInflight = new Map<
+  string,
+  Promise<{ lat: number; lon: number } | null>
+>();
 let _geocodeQueueTail: Promise<unknown> = Promise.resolve();
 
 function geocodeLabel(
@@ -129,16 +119,6 @@ interface Centroid {
 const EARTH_RADIUS_KM = 6371;
 const MIN_RADIUS_KM = 8;
 const MAX_RADIUS_KM = 80;
-
-const TILE_URL =
-  "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png";
-const TILE_ATTR =
-  '&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a> &copy; <a href="https://carto.com/attributions">CARTO</a>';
-
-const ZOOM_TARGET = 10;
-const ZOOM_DURATION_S = 1.2;
-const ZOOM_EASE = 0.1;
-const ZOOM_TOTAL_MS = ZOOM_DURATION_S * 1000;
 
 function haversineKm(
   a: { lat: number; lon: number },
@@ -269,42 +249,6 @@ function computeCentroid(points: GeoPoint[]): Centroid | null {
   return { lat, lon, meanConfidence: weightedConf, radiusKm, bestLabel };
 }
 
-function HyperzoomController({ centroid }: { centroid: Centroid }) {
-  const map = useMap();
-
-  useEffect(() => {
-    const latRad = (centroid.lat * Math.PI) / 180;
-    const cosLat = Math.max(0.1, Math.cos(latRad));
-    const latSpan = centroid.radiusKm / 111;
-    const lonSpan = centroid.radiusKm / (111 * cosLat);
-    const bounds = L.latLngBounds(
-      [centroid.lat - latSpan, centroid.lon - lonSpan],
-      [centroid.lat + latSpan, centroid.lon + lonSpan],
-    );
-
-    map.stop();
-    map.setView([20, 0], 2, { animate: false });
-
-    const raf = window.requestAnimationFrame(() => {
-      map.invalidateSize({ animate: false, pan: false });
-      map.flyToBounds(bounds, {
-        padding: [40, 40],
-        maxZoom: ZOOM_TARGET,
-        duration: ZOOM_DURATION_S,
-        easeLinearity: ZOOM_EASE,
-        noMoveStart: true,
-      });
-    });
-
-    return () => {
-      window.cancelAnimationFrame(raf);
-      map.stop();
-    };
-  }, [centroid.lat, centroid.lon, map]);
-
-  return null;
-}
-
 export default function GeoMap({ findings }: Props) {
   const signals = useMemo(() => collectSignals(findings), [findings]);
 
@@ -357,17 +301,27 @@ export default function GeoMap({ findings }: Props) {
   }, [signals, resolvedLabels]);
 
   const centroid = useMemo(() => computeCentroid(points), [points]);
-  const [zoomingDone, setZoomingDone] = useState(false);
 
-  useEffect(() => {
-    if (!centroid) {
-      setZoomingDone(false);
-      return;
-    }
-    const totalMs = ZOOM_TOTAL_MS + 120;
-    const t = window.setTimeout(() => setZoomingDone(true), totalMs);
-    return () => window.clearTimeout(t);
-  }, [centroid?.lat, centroid?.lon]);
+  const globePoints = useMemo<GlobePoint[]>(
+    () =>
+      points.map((p) => ({
+        lat: p.lat,
+        lon: p.lon,
+        confidence: p.confidence,
+        category: p.category,
+        label: p.label,
+        source: p.source,
+      })),
+    [points],
+  );
+
+  const globeCentroid = useMemo<GlobeCentroid | null>(
+    () =>
+      centroid
+        ? { lat: centroid.lat, lon: centroid.lon, radiusKm: centroid.radiusKm }
+        : null,
+    [centroid?.lat, centroid?.lon, centroid?.radiusKm],
+  );
 
   const pendingGeocodes = signals.filter(
     (s) =>
@@ -434,80 +388,10 @@ export default function GeoMap({ findings }: Props) {
       )}
 
       <div className="relative overflow-hidden border border-kali-border bg-kali-bg">
-        <MapContainer
-          center={[20, 0]}
-          zoom={2}
-          minZoom={2}
-          maxZoom={18}
-          maxBounds={[[-85, -180], [85, 180]]}
-          maxBoundsViscosity={1.0}
-          zoomControl={false}
-          attributionControl={false}
-          className="h-[420px] w-full"
-          style={{ background: "#000000" }}
-        >
-          <TileLayer url={TILE_URL} attribution={TILE_ATTR} noWrap />
+        <Globe points={globePoints} centroid={globeCentroid} height={460} />
 
-          <HyperzoomController centroid={centroid} />
-
-          <Circle
-            center={[centroid.lat, centroid.lon]}
-            radius={centroid.radiusKm * 1000}
-            pathOptions={{
-              color: "#FFFFFF",
-              weight: 1,
-              opacity: 0.75,
-              dashArray: "5 4",
-              fillColor: "#FFFFFF",
-              fillOpacity: 0.06,
-            }}
-          />
-
-          {zoomingDone && (
-            <CircleMarker
-              center={[centroid.lat, centroid.lon]}
-              radius={10}
-              pathOptions={{
-                color: "#FFFFFF",
-                weight: 1,
-                fillColor: "#FFFFFF",
-                fillOpacity: 0.35,
-                className: "animate-running-pulse",
-              }}
-            />
-          )}
-
-          {points.map((p, i) => {
-            const isTag = p.category === "tag";
-            return (
-              <CircleMarker
-                key={`p-${i}`}
-                center={[p.lat, p.lon]}
-                radius={isTag ? 5 + p.confidence * 2 : 3 + p.confidence * 4}
-                pathOptions={
-                  isTag
-                    ? {
-                        color: "#FFFFFF",
-                        weight: 1,
-                        opacity: zoomingDone ? 0.85 : 0.35,
-                        fillColor: "#FFFFFF",
-                        fillOpacity: zoomingDone ? 0.1 : 0.04,
-                        dashArray: "2 2",
-                      }
-                    : {
-                        color: "#000000",
-                        weight: 1,
-                        fillColor: "#FFFFFF",
-                        fillOpacity: zoomingDone ? 0.95 : 0.4,
-                      }
-                }
-              />
-            );
-          })}
-        </MapContainer>
-
-        <div className="pointer-events-none absolute bottom-2 left-2 z-[400] bg-kali-bg px-2 py-1 font-mono text-[10px] uppercase tracking-label text-kali-label">
-          leaflet &middot; carto &middot; weighted by confidence
+        <div className="pointer-events-none absolute bottom-2 left-2 z-[5] bg-kali-bg/80 px-2 py-1 font-mono text-[10px] uppercase tracking-label text-kali-label">
+          three.js &middot; wireframe earth &middot; drag to rotate &middot; scroll to zoom
         </div>
       </div>
 
@@ -515,8 +399,7 @@ export default function GeoMap({ findings }: Props) {
         {points
           .slice()
           .sort((a, b) => {
-            const order = (p: GeoPoint) =>
-              p.category === "tag" ? 1 : 0;
+            const order = (p: GeoPoint) => (p.category === "tag" ? 1 : 0);
             const dg = order(a) - order(b);
             if (dg !== 0) return dg;
             return b.confidence - a.confidence;

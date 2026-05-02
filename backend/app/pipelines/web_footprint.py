@@ -61,19 +61,34 @@ _QUERY_GEN_SYSTEM_PROMPT = (
 
 _TRIAGE_SYSTEM_PROMPT = (
     "You are an OSINT relevance classifier. Given a search result about a "
-    "target person, determine if it contains personally identifiable "
-    "information or is likely about the target. Respond with JSON: "
+    "target person, decide if the page is likely about that target AND "
+    "contains personally identifiable information.\n\n"
+    "For 'relevance_reason': write ONE short plain-English sentence "
+    "(<=100 chars) describing why. Do NOT paste raw snippet text, HTML, "
+    "URLs, or quotes from the result.\n"
+    "For 'pii_types': use short lowercase category labels only "
+    "(e.g. 'email', 'phone', 'workplace', 'school'). No prose.\n\n"
+    "Respond with JSON only: "
     "{\"relevant\": bool, \"relevance_reason\": str, \"pii_types\": [str]}"
 )
 
 
 def _extract_system_prompt(username: str, full_name: str) -> str:
     return (
-        "You are an OSINT extractor. Given a web page about a target person "
-        f"(username: {username}, name: {full_name}), extract all personally "
-        "identifiable information. Respond with JSON: {\"findings\": "
-        "[{\"type\": str, \"value\": str, \"context\": str, "
-        "\"confidence\": float}]}"
+        "You are an OSINT extractor analyzing a web page about a target "
+        f"person (username: {username}, name: {full_name}). Extract only "
+        "personally identifiable information that clearly belongs to this "
+        "target. Skip ambiguous, generic, or unrelated values.\n\n"
+        "Field rules:\n"
+        "- 'type': short lowercase label (e.g. 'email', 'phone', "
+        "'workplace', 'school', 'real_name', 'home_address').\n"
+        "- 'value': the discovered value itself, nothing else.\n"
+        "- 'context': ONE concise plain-English sentence (<=120 chars) "
+        "describing where on the page it appeared and why it ties to the "
+        "target. Do NOT paste raw page text, HTML, markdown, or quotes.\n"
+        "- 'confidence': float between 0 and 1.\n\n"
+        "Respond with JSON only: {\"findings\": [{\"type\": str, "
+        "\"value\": str, \"context\": str, \"confidence\": float}]}"
     )
 
 
@@ -211,6 +226,16 @@ async def _triage_result(
     parsed = _parse_json_response(text)
     if parsed is None:
         return None
+    parsed["relevance_reason"] = _clean_one_liner(
+        parsed.get("relevance_reason"), max_len=140
+    )
+    raw_types = parsed.get("pii_types") or []
+    if isinstance(raw_types, list):
+        parsed["pii_types"] = [
+            _clean_one_liner(t, max_len=40) for t in raw_types if t
+        ][:8]
+    else:
+        parsed["pii_types"] = []
     return parsed
 
 
@@ -264,13 +289,29 @@ async def _extract_pii(
             confidence = 0.0
         cleaned.append(
             {
-                "type": str(item.get("type", "") or "unknown").strip(),
-                "value": str(item.get("value", "") or "").strip(),
-                "context": str(item.get("context", "") or "").strip(),
+                "type": str(item.get("type", "") or "unknown").strip()[:40],
+                "value": str(item.get("value", "") or "").strip()[:200],
+                "context": _clean_one_liner(item.get("context", ""), max_len=140),
                 "confidence": max(0.0, min(1.0, confidence)),
             }
         )
     return cleaned
+
+
+def _clean_one_liner(raw: object, max_len: int) -> str:
+    """Collapse whitespace, strip code fences/quotes, and truncate.
+
+    Defends against models that ignore the prompt and dump multi-line raw
+    page excerpts into a field that's supposed to be one short sentence.
+    """
+    if raw is None:
+        return ""
+    s = str(raw).replace("\r", " ").replace("\n", " ").replace("\t", " ")
+    s = s.strip().strip("`").strip("\"'").strip()
+    s = " ".join(s.split())
+    if len(s) > max_len:
+        s = s[: max_len - 1].rstrip() + "…"
+    return s
 
 
 # ---------------------------------------------------------------------------
@@ -1498,14 +1539,21 @@ async def run(session: SessionState) -> None:
                     finding_type = item.get("type", "unknown") or "unknown"
                     confidence = float(item.get("confidence", 0.0) or 0.0)
                     risk_level = _risk_level_for_pii(finding_type)
+                    source_host = (
+                        result.get("displayLink", "") or _domain_of(url)
+                    )
+                    pretty_type = finding_type.replace("_", " ")
+                    chain: list[str] = []
+                    if source_host:
+                        chain.append(f"Source: {source_host}")
+                    chain.append(f"URL: {url}")
+                    chain.append(f"Found: {pretty_type} — {value}")
+                    ctx = (item.get("context") or "").strip()
+                    if ctx:
+                        chain.append(f"Why: {ctx}")
                     finding = Finding(
                         source=f"web_dork_{idx}",
-                        evidence_chain=[
-                            f"Query: {query}",
-                            f"URL: {url}",
-                            f"Found: {finding_type}: {value}",
-                            f"Context: {item.get('context', '')}",
-                        ],
+                        evidence_chain=chain,
                         confidence=max(0.0, min(1.0, confidence)),
                         risk_level=risk_level,  # type: ignore[arg-type]
                         remediation=_remediation_for(url, finding_type),

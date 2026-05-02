@@ -88,3 +88,46 @@ export class FetchProfileError extends Error {
     this.retryAfter = retryAfter;
   }
 }
+
+export type KnowledgeNodeKind =
+  | "profile"
+  | "pipeline"
+  | "finding"
+  | "location"
+  | "platform"
+  | "url"
+  | "identity"
+  | "remediation"
+  | "summary";
+
+export type KnowledgeLinkKind =
+  | "owns"
+  | "contains"
+  | "suggests"
+  | "references"
+  | "located_at"
+  | "matches"
+  | "summarizes";
+
+export interface KnowledgeNode {
+  id: string;
+  label: string;
+  kind: KnowledgeNodeKind;
+  pipeline?: PipelineName;
+  risk?: RiskLevel;
+  score?: number;
+  detail?: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface KnowledgeLink {
+  source: string;
+  target: string;
+  kind: KnowledgeLinkKind;
+  weight?: number;
+}
+
+export interface KnowledgeGraphData {
+  nodes: KnowledgeNode[];
+  links: KnowledgeLink[];
+}

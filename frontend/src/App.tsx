@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import LandingPage from "./components/LandingPage";
 import AuditDashboard from "./components/AuditDashboard";
+import MatrixRain from "./components/MatrixRain";
 
 const AUDIT_PATH_REGEX = /^\/audit\/([A-Za-z0-9_-]+)\/?$/;
 
@@ -61,6 +62,7 @@ export default function App() {
 
   return (
     <>
+      <MatrixRain />
       <TerminalBar pathname={pathname} />
       {route.name === "audit" && route.sessionId ? (
         <AuditDashboard sessionId={route.sessionId} />

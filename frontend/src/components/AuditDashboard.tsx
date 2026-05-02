@@ -6,6 +6,7 @@ import PipelineColumn from "./PipelineColumn";
 import RemediationDrawer from "./RemediationDrawer";
 import ExposureScore from "./ExposureScore";
 import GeoMap from "./GeoMap";
+import KnowledgeGraphPanel from "./KnowledgeGraphPanel";
 
 interface Props {
   sessionId: string;
@@ -35,12 +36,7 @@ export default function AuditDashboard({ sessionId }: Props) {
       <AuditHeader
         profile={audit.profile}
         totalFindings={audit.totalFindings}
-        cost={audit.cost}
-        costTick={audit.costTick}
-        pipelineStatuses={audit.pipelineStatuses}
         aggregator={audit.aggregator}
-        connected={audit.connected}
-        streamDone={audit.streamDone}
       />
 
       <main className="mx-auto w-full max-w-[1280px] px-4 py-6 sm:px-6">
@@ -116,6 +112,16 @@ export default function AuditDashboard({ sessionId }: Props) {
             />
           ))}
         </section>
+
+        {(audit.totalFindings > 0 || audit.aggregator) && (
+          <section className="mt-6">
+            <KnowledgeGraphPanel
+              profile={audit.profile}
+              findingsByPipeline={audit.findingsByPipeline}
+              aggregator={audit.aggregator}
+            />
+          </section>
+        )}
       </main>
 
       <RemediationDrawer aggregator={audit.aggregator} />

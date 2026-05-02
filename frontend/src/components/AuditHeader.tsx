@@ -1,32 +1,17 @@
-import { AggregatorResult, PipelineName, Profile } from "../types";
-import { PipelineStatusState } from "../hooks/useAudit";
-import { formatCount, pipelineTitle } from "../utils/format";
-import StatusChip from "./StatusChip";
-import CostDisplay from "./CostDisplay";
+import { AggregatorResult, Profile } from "../types";
+import { formatCount } from "../utils/format";
 import ExposureScore from "./ExposureScore";
 
 interface Props {
   profile: Profile | null;
   totalFindings: number;
-  cost: number;
-  costTick: number;
-  pipelineStatuses: Record<PipelineName, PipelineStatusState>;
   aggregator: AggregatorResult | null;
-  connected: boolean;
-  streamDone: boolean;
 }
-
-const PIPELINES: PipelineName[] = ["identity", "geolocation", "web_footprint"];
 
 export default function AuditHeader({
   profile,
   totalFindings,
-  cost,
-  costTick,
-  pipelineStatuses,
   aggregator,
-  connected,
-  streamDone,
 }: Props) {
   return (
     <header className="sticky top-0 z-30 border-b border-kali-border bg-kali-bg">
@@ -53,25 +38,7 @@ export default function AuditHeader({
           </div>
 
           <ExposureScore aggregator={aggregator} compact />
-
-          <CostDisplay cost={cost} tick={costTick} />
-
-          <ConnectionToken connected={connected} streamDone={streamDone} />
         </div>
-      </div>
-
-      <div className="mx-auto flex w-full max-w-[1280px] flex-wrap items-center gap-3 px-4 pb-3 sm:px-6">
-        {PIPELINES.map((p) => (
-          <div key={p} className="flex items-center gap-2">
-            <span className="font-mono text-[10px] uppercase tracking-label text-kali-label">
-              [{pipelineTitle(p)}]
-            </span>
-            <StatusChip
-              status={pipelineStatuses[p].status}
-              detail={pipelineStatuses[p].detail}
-            />
-          </div>
-        ))}
       </div>
     </header>
   );
@@ -110,35 +77,5 @@ function ProfileSkeleton() {
         <div className="h-2 w-16 animate-running-pulse bg-kali-surface" />
       </div>
     </div>
-  );
-}
-
-function ConnectionToken({
-  connected,
-  streamDone,
-}: {
-  connected: boolean;
-  streamDone: boolean;
-}) {
-  let token = "[ ]";
-  let label = "connecting";
-  let cls = "text-kali-label";
-  if (streamDone) {
-    token = "[OK]";
-    label = "done";
-    cls = "text-kali-text";
-  } else if (connected) {
-    token = "[*]";
-    label = "live";
-    cls = "text-kali-text animate-running-pulse";
-  }
-  return (
-    <span
-      title={label}
-      className="flex items-center gap-1.5 font-mono text-[10px] uppercase tracking-label text-kali-label"
-    >
-      <span className={cls}>{token}</span>
-      {label}
-    </span>
   );
 }

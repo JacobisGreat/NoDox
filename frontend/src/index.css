@@ -16,12 +16,16 @@
 
 html, body, #root { min-height: 100vh; }
 
-html { font-size: 14px; }
+html {
+  font-size: 14px;
+  background: var(--kali-bg);
+}
 @media (max-width: 640px) { html { font-size: 15px; } }
 
 body {
   margin: 0;
-  background: var(--kali-bg);
+  /* transparent so the MatrixRain canvas (fixed, z-index -1) shows through */
+  background: transparent;
   color: var(--kali-text);
   font-family: "JetBrains Mono", ui-monospace, monospace;
   line-height: 1.4;
@@ -57,14 +61,3 @@ body {
 *::-webkit-scrollbar-thumb { background: var(--kali-border); }
 *::-webkit-scrollbar-thumb:hover { background: var(--kali-text); }
 
-/* Leaflet overrides — strict B&W only. */
-.leaflet-container { background: var(--kali-bg) !important; font-family: inherit; }
-.leaflet-tile { filter: grayscale(1) contrast(1.15) brightness(0.85); }
-.leaflet-control-attribution {
-  background: var(--kali-bg) !important;
-  color: var(--kali-dim) !important;
-  border: 1px solid var(--kali-border);
-  border-radius: 0;
-  font-size: 10px;
-}
-.leaflet-control-attribution a { color: var(--kali-text) !important; }
