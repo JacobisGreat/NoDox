@@ -10,6 +10,33 @@ interface Props {
   findings: Finding[];
 }
 
+// Per-pipeline microcopy. Generic "pipeline running..." wastes a slot
+// where we could be communicating *what* the audit is actually doing.
+// Concrete scope reduces uncertainty and shortens perceived wait time
+// (Maister: "filled time feels shorter than empty time"). Sub-second
+// visibility into the work also reinforces the audit's credibility — the
+// user can see we're touching real data, not just spinning a circle.
+const PIPELINE_COPY: Record<
+  PipelineName,
+  { running: string; clean: string; awaiting: string }
+> = {
+  identity: {
+    running: "sweeping 1,001 platforms for matching usernames...",
+    clean: "no identity matches across 1,001 platforms.",
+    awaiting: "queued. identity sweep starts shortly.",
+  },
+  geolocation: {
+    running: "reading EXIF, captions, and visual cues from posts...",
+    clean: "no location signals surfaced from public posts.",
+    awaiting: "queued. geolocation analysis starts shortly.",
+  },
+  web_footprint: {
+    running: "searching the open web for this handle...",
+    clean: "no public web mentions matched.",
+    awaiting: "queued. web footprint search starts shortly.",
+  },
+};
+
 export default function PipelineColumn({ pipeline, status, findings }: Props) {
   return (
     <section className="flex min-h-[320px] flex-col border border-nodoxx-border bg-nodoxx-panel">
@@ -27,7 +54,7 @@ export default function PipelineColumn({ pipeline, status, findings }: Props) {
 
       <div className="flex-1 space-y-3 overflow-y-auto p-4 lg:max-h-[calc(100vh-320px)]">
         {findings.length === 0 ? (
-          <EmptyState status={status} />
+          <EmptyState pipeline={pipeline} status={status} />
         ) : (
           findings.map((finding, idx) => (
             <FindingCard key={`${pipeline}-${idx}`} finding={finding} />
@@ -38,19 +65,26 @@ export default function PipelineColumn({ pipeline, status, findings }: Props) {
   );
 }
 
-function EmptyState({ status }: { status: PipelineStatusState }) {
-  let label = "awaiting findings...";
+function EmptyState({
+  pipeline,
+  status,
+}: {
+  pipeline: PipelineName;
+  status: PipelineStatusState;
+}) {
+  const copy = PIPELINE_COPY[pipeline];
+  let label = copy.awaiting;
   if (status.status === "running") {
-    label = (status.detail ?? "pipeline running...").toLowerCase();
+    label = (status.detail ?? copy.running).toLowerCase();
   } else if (status.status === "complete") {
-    label = "no findings surfaced.";
+    label = copy.clean;
   } else if (status.status === "error") {
     label = (status.detail ?? "pipeline error.").toLowerCase();
   } else if (status.status === "budget_exceeded") {
     label = (status.detail ?? "budget exceeded.").toLowerCase();
   }
   return (
-    <div className="flex h-full min-h-[180px] items-center justify-center border border-dashed border-nodoxx-border px-4 py-8 text-center font-mono text-[11px] text-nodoxx-muted">
+    <div className="flex h-full min-h-[180px] items-center justify-center border border-dashed border-nodoxx-border px-4 py-8 text-center font-mono text-[11px] leading-relaxed text-nodoxx-muted">
       &gt; {label}
     </div>
   );
